@@ -1,0 +1,11 @@
+android.autoinstalls.config.scbc.device
+com.alphainventor.filemanager
+com.android.tv.feedbackconsent
+com.apps.mk.wd
+com.apps.wifihotspot
+com.google.android.apps.tv.launcherx
+com.jio.media.stb.ondemand
+com.mk.tv.systemserver
+com.mxtech.videoplayer.television
+com.realtek.leanbacklauncher.partnercustomizer
+com.yupptv.scope.tvapp

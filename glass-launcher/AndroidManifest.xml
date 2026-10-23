@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.madhu.glasslauncher" android:versionCode="10" android:versionName="1.5">
+    <uses-sdk android:minSdkVersion="34" android:targetSdkVersion="34"/>
+    <uses-feature android:name="android.software.leanback" android:required="false"/>
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent>
+        <package android:name="com.realtek.tv"/>
+    </queries>
+    <application android:label="Glass Home" android:icon="@drawable/icon" android:banner="@drawable/banner"
+        android:theme="@style/Home" android:allowBackup="false" android:largeHeap="false">
+        <activity android:name=".HomeActivity" android:exported="true" android:launchMode="singleTask"
+            android:stateNotNeeded="true" android:clearTaskOnLaunch="true" android:screenOrientation="landscape"
+            android:resumeWhilePausing="true" android:excludeFromRecents="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode|smallestScreenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.HOME"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
