@@ -3,6 +3,10 @@
 Debloats an Acer R4G Google TV over ADB and replaces the stock home screen with **Glass Home**, a
 small custom launcher (no Gradle, no AndroidX, ~51–68 MB PSS).
 
+![Glass Home on the TV: top bar with Inputs, Wi-Fi, audio output and Settings pills and a RAM gauge; clock and greeting on the left; weather, Nifty 50, screen time and calendar widgets on the right; a four-app dock along the bottom](docs/glass-home.png)
+
+*Glass Home v1.4 on the TV (the Wi-Fi name and the weather location have been replaced).*
+
 Everything is reversible. Nothing is deleted from the system partition: 11 packages are **disabled**
 and 20 are **hidden for user 0** (`pm uninstall -k --user 0`). Hiding is needed because Acer's boot job
 re-enables some disabled apps ([see below](#hidden-apps-and-acers-boot-time-re-enable)). A factory reset
