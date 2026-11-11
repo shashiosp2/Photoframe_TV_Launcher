@@ -1,0 +1,25 @@
+# Sample /sdcard/.launcherconfig template
+# Place this at /sdcard/.launcherconfig on your Android TV device.
+
+# WebDAV configuration for ambient photo frame slideshow
+webdav_url=http://192.168.1.100:8080/remote.php/webdav/Photos/
+webdav_username=myuser
+webdav_password=mypassword
+
+# Slideshow interval in seconds
+slideshow_interval_sec=30
+
+# Inactivity auto-hide timeout for app dock (in seconds)
+inactivity_timeout_sec=15
+
+# Global TV inactivity watchdog timeout before returning to launcher (in minutes)
+screensaver_timeout_min=10
+
+# Dual Clocks / Timezones
+local_tz_label=Local
+local_tz_id=America/Chicago
+secondary_tz_label=UTC
+secondary_tz_id=UTC
+
+# Dock Apps (comma-separated package names)
+pinned_apps=com.google.android.youtube.tv,com.netflix.ninja,org.xbmc.kodi,com.plexapp.android

@@ -11,3 +11,7 @@ glass-launcher/GlassHome.apk
 backup/
 *.apk
 CLAUDE.local.md
+*.idsig
+*.db
+*.db-journal
+.launcherconfig

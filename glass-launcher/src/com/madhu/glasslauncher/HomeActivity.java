@@ -4,14 +4,13 @@ import android.animation.ArgbEvaluator;
 import android.animation.TimeInterpolator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
-import android.app.ActivityManager;
 import android.database.ContentObserver;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.content.pm.ActivityInfo;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
@@ -39,8 +38,6 @@ import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.HandlerThread;
-import android.os.Process;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -55,105 +52,228 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextClock;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
+import java.util.Queue;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Glass Home: a small Apple-TV-style launcher for Android TV.
- * Pure framework views (no AndroidX), absolute layout in dp for a 960x540dp screen,
- * a hand-rolled focus model so D-pad navigation is deterministic.
+ * Glass Home: Apple-TV-inspired launcher for Android TV.
+ * Dual Timezones (CST on left, IST on right), Sleep & Gemini/Assistant action buttons,
+ * single row for all apps with horizontal gliding, bottom control pills (Inputs, Wi-Fi, Audio, Settings),
+ * and dynamic on-screen app reordering.
  */
 public class HomeActivity extends Activity {
 
-    // Default dock (left to right). Override without rebuilding: put package names, one per
-    // line, in /sdcard/Android/data/com.madhu.glasslauncher/files/dock.txt
     static final String[] DEFAULT_DOCK = {
-            "com.google.android.youtube.tv", "com.suntv.sunnxt", "in.startv.hotstar", "com.netflix.ninja"};
+            "org.smarttube.stable",
+            "com.amazon.amazonvideo.livingroom",
+            "com.google.android.youtube.tv",
+            "org.videolan.vlc"
+    };
+
     static final HashSet<String> HIDDEN = new HashSet<String>();
     static {
         HIDDEN.add("com.madhu.glasslauncher");
-        HIDDEN.add("com.android.tv.settings");      // reachable from the Settings pill
+        HIDDEN.add("com.minimal.appletvlauncher");
+        HIDDEN.add("com.google.android.tvlauncher");
+        HIDDEN.add("com.google.android.tv");
     }
 
-    static final int TOP = 0, DOCK = 1, GRID = 2;
-    static final int COLS = 4;
-
     // geometry in dp (960 x 540 dp screen)
-    static final float SIDE = 48, BAND_Y = 348, BAND_H = 160, BAND_PAD = 22;
-    static final float TILE_W = 182, TILE_H = 102, LABEL_H = 22;
-    static final float GRID_TOP = 584, ROW_PITCH = 150, GRID_FOCUS_Y = 170;
+    static final float SIDE = 48;
+    static final float ROW_H = 44;
+    static final float ROW_Y = 466;
+    static final float TIME_Y = 432;
+    static final float ACTION_W_GEMINI = 96;
+    static final float ACTION_W_SLEEP = 86;
+    static final float APP_TILE_W = 78;
+    static final float GAP = 12;
     static final float SCALE = 1.08f;
+
+    static final int TYPE_GEMINI = 0, TYPE_SLEEP = 1, TYPE_APP = 2;
 
     float dp;
     Typeface fThin, fLight, fReg, fMed, fBold;
-    View topScrim;
     PackageManager pm;
     SharedPreferences prefs;
     Handler handler = new Handler();
 
-    FrameLayout root, content, overlay;
-    Pane pane;
-    View glow, glass, dropdown;
-    GradientDrawable glowDrawable;
-    TextView appName, greeting, wifiText, audioText;
-    LinearLayout pillRow;
-    FrameLayout topBar;
-    static final int P_INPUTS = 0, P_WIFI = 1, P_AUDIO = 2, P_SETTINGS = 3;
-    final View[] pills = new View[4];
-    final TextView[] pillText = new TextView[4];
+    FrameLayout root, content, overlay, shelfContainer;
+    LinearLayout timeRow;
+    View glass;
+    TextView cstTag, istTag, deviceNameView;
+    View deviceSpacer;
+    TextClock clockCst, clockIst;
 
-    // top bar: RAM gauge (display only)
-    Widgets.Bar ramBar;
-    TextView ramText;
+    boolean shelfAutohide = true;
+    int shelfHideTimeout = 8; // seconds
+    boolean isShelfHidden = false;
 
-    // widgets (right side)
-    static final float WX = 476, WY = 84, WCOL = 220, CALX = 704, CALW = 208, WBOTTOM = 326;
-    TextView wTemp, wCond, wSub, wPlace, wHiLo, nVal, nChg, nStatus, stVal, stSub;
-    Widgets.WeatherIcon wIcon;
-    ImageView wIconView;
-    Widgets.Sparkline spark;
-    Widgets.MonthView month;
-    HandlerThread netThread;
-    Handler net;
-    double lat = Double.NaN, lon = Double.NaN;   // no default; set in files/widgets.txt
-    String place = "Weather";
+    String deviceName = "NVIDIA AndroidTV";
+    String tzLeft = "America/Chicago";
+    String tzLeftTag = "CST";
+    String tzRight = "Asia/Kolkata";
+    String tzRightTag = "IST";
+    int watchdogTimeout = 300;
 
-    final ArrayList<App> dockApps = new ArrayList<App>();
-    final ArrayList<App> gridApps = new ArrayList<App>();
-    final ArrayList<Tile> dockTiles = new ArrayList<Tile>();
-    final ArrayList<Tile> gridTiles = new ArrayList<Tile>();
-    final ArrayList<View> gridViews = new ArrayList<View>();
-    final HashMap<String, Integer> colorCache = new HashMap<String, Integer>();
+    // WebDAV / Photo Settings
+    String webdavUrl = "";
+    String webdavFolder = "";
+    String webdavUser = "";
+    String webdavPass = "";
+    int webdavRefreshInterval = 15;
+    boolean webdavRecursive = true;
+    boolean wallpaperGlowEnabled = true;
 
-    int zone = DOCK, topIdx = 0, dockIdx = 0, gridIdx = 0;
-    boolean visible, longPressed;
-    float curTrans = 0;
-    RectF glassRect = new RectF();
-    float glassRadius;
-    ValueAnimator moveAnim, glowAnim;
-    int glowColor = 0xFF3A3A40;
-    Tile scaledTile;
+    final Runnable shelfHideRunnable = new Runnable() {
+        @Override
+        public void run() {
+            hideShelf(true);
+        }
+    };
 
-    // dropdown state
-    final ArrayList<InputItem> inputs = new ArrayList<InputItem>();
-    final ArrayList<TextView> inputRows = new ArrayList<TextView>();
-    int inputIdx = 0;
-    boolean dropdownOpen;
+    void resetShelfHideTimer() {
+        handler.removeCallbacks(shelfHideRunnable);
+        if (shelfAutohide && shelfHideTimeout > 0 && visible) {
+            handler.postDelayed(shelfHideRunnable, shelfHideTimeout * 1000L);
+        }
+    }
+
+    void hideShelf(boolean animate) {
+        if (!shelfAutohide || isShelfHidden || !visible || reorderMode) return;
+        isShelfHidden = true;
+
+        if (shelfContainer != null) {
+            shelfContainer.animate()
+                    .translationY(px(80))
+                    .alpha(0f)
+                    .setDuration(animate ? 400 : 0)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+        }
+
+        if (glass != null) {
+            glass.animate()
+                    .alpha(0f)
+                    .setDuration(animate ? 250 : 0)
+                    .start();
+        }
+
+        if (timeRow != null) {
+            // Translate timeRow down by 54dp so it rests right near the bottom screen edge
+            timeRow.animate()
+                    .translationY(px(54))
+                    .setDuration(animate ? 400 : 0)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+        }
+    }
+
+    void showShelf(boolean animate) {
+        resetShelfHideTimer();
+        if (!isShelfHidden) return;
+        isShelfHidden = false;
+
+        if (shelfContainer != null) {
+            shelfContainer.animate()
+                    .translationY(0f)
+                    .alpha(1f)
+                    .setDuration(animate ? 300 : 0)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+        }
+
+        if (glass != null) {
+            glass.animate()
+                    .alpha(1f)
+                    .setDuration(animate ? 300 : 0)
+                    .start();
+        }
+
+        if (timeRow != null) {
+            timeRow.animate()
+                    .translationY(0f)
+                    .setDuration(animate ? 300 : 0)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+        }
+    }
+    // Photo & Glow Views
+    ImageView glowA, glowB;
+    ImageView photoA, photoB;
+    boolean isBufferAActive = true;
+    final ExecutorService photoExecutor = Executors.newSingleThreadExecutor();
+    boolean isCrawling = false;
+    final Random rng = new Random();
+    android.os.FileObserver configObserver;
+
+    // Vibrant Glow Palette
+    static final int[] GLOW_COLORS = {
+            0xFF0EA5E9, // Sky Blue
+            0xFF6366F1, // Indigo
+            0xFF8B5CF6, // Purple
+            0xFFEC4899, // Pink
+            0xFFF43F5E, // Rose
+            0xFFF59E0B, // Amber
+            0xFF10B981, // Emerald
+            0xFF06B6D4, // Cyan
+            0xFF84CC16, // Lime
+            0xFFD946EF  // Fuchsia
+    };
+
+    final Runnable photoRotateRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (visible && webdavRefreshInterval > 0) {
+                rotateToNextPhoto();
+                handler.postDelayed(this, webdavRefreshInterval * 1000L);
+            }
+        }
+    };
 
     static class App { String pkg, label; ResolveInfo ri; Drawable banner; boolean isBanner; }
-    static class Tile { App app; FrameLayout card; TextView label; float x, y; }
-    static class InputItem { String label, id; boolean liveTv, current; int audio = -1; }
-    int dropdownPill = P_INPUTS;
+    static class ShelfItem { int type; App app; FrameLayout card; float x, width; }
+
+    final ArrayList<App> apps = new ArrayList<App>();
+    final ArrayList<ShelfItem> shelfItems = new ArrayList<ShelfItem>();
+
+    int shelfIdx = 2; // Always default to first real app (YouTube)
+    boolean visible, longPressed, reorderMode;
+    float curShelfTransX = 0;
+    RectF glassRect = new RectF();
+    float glassRadius;
+    ValueAnimator moveAnim, scrollAnim;
+    ShelfItem scaledItem;
+
+    final Runnable longPressRunnable = new Runnable() {
+        public void run() {
+            if (shelfIdx >= 2) {
+                longPressed = true;
+                toggleReorderMode();
+            }
+        }
+    };
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -165,70 +285,217 @@ public class HomeActivity extends Activity {
         prefs = getSharedPreferences("state", MODE_PRIVATE);
         fThin = font("outfit_200.ttf"); fLight = font("outfit_300.ttf");
         fReg = font("outfit_400.ttf"); fMed = font("outfit_500.ttf"); fBold = font("outfit_600.ttf");
-        zone = prefs.getInt("zone", DOCK);
-        if (zone == TOP) zone = DOCK;
-        topIdx = prefs.getInt("top", 0); dockIdx = prefs.getInt("dock", 0); gridIdx = prefs.getInt("grid", 0);
-        netThread = new HandlerThread("glass-net", Process.THREAD_PRIORITY_BACKGROUND);
-        netThread.start();
-        net = new Handler(netThread.getLooper());
-        readWidgetConfig();
+        shelfIdx = 2; // Always default to first real app
+
+        loadConfigFile();
         buildUi();
-        buildWidgets();
         loadApps();
         registerReceivers();
-        updateWifi();
-        updateAudioPill();
-        updateGreeting();
-        showCachedWidgets();
+        startConfigWatcher();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         visible = true;
-        updateWifi();
-        updateAudioPill();
-        updateGreeting();
-        month.invalidate();
-        handler.removeCallbacks(ramTick); handler.post(ramTick);
-        maybeFetchWeather();
-        handler.removeCallbacks(niftyTick); handler.post(niftyTick);
-        maybeComputeScreenTime();
-        root.post(new Runnable() { public void run() { focusCurrent(false); } });
+        if (reorderMode) toggleReorderMode();
+        updateClockFormats();
+        startPhotoRotation();
+        resetShelfHideTimer();
+        root.post(new Runnable() { public void run() { goToFirstApp(false); } });
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         visible = false;
-        closeDropdown();
-        handler.removeCallbacks(ramTick);
-        handler.removeCallbacks(niftyTick);
-        handler.removeCallbacks(weatherTick);
-        prefs.edit().putInt("zone", zone).putInt("top", topIdx).putInt("dock", dockIdx).putInt("grid", gridIdx).apply();
+        handler.removeCallbacks(shelfHideRunnable);
+        stopPhotoRotation();
+        if (reorderMode) toggleReorderMode();
+    }
+
+    void updateClockFormats() {
+        loadConfigFile();
+        if (deviceNameView != null) {
+            if (deviceName != null && !deviceName.trim().isEmpty()) {
+                deviceNameView.setText(deviceName.trim());
+                deviceNameView.setVisibility(View.VISIBLE);
+                if (deviceSpacer != null) deviceSpacer.setVisibility(View.VISIBLE);
+            } else {
+                deviceNameView.setVisibility(View.GONE);
+                if (deviceSpacer != null) deviceSpacer.setVisibility(View.GONE);
+            }
+        }
+        boolean is24 = prefs.getBoolean("clock_24h", false);
+        String tf = is24 ? "H:mm" : "h:mm a";
+        if (cstTag != null) cstTag.setText(tzLeftTag);
+        if (clockCst != null) {
+            clockCst.setTimeZone(tzLeft);
+            clockCst.setFormat12Hour(tf);
+            clockCst.setFormat24Hour(tf);
+        }
+        if (istTag != null) istTag.setText(tzRightTag);
+        if (clockIst != null) {
+            clockIst.setTimeZone(tzRight);
+            clockIst.setFormat12Hour(tf);
+            clockIst.setFormat24Hour(tf);
+        }
+    }
+
+    void startConfigWatcher() {
+        try {
+            File sdcardDir = android.os.Environment.getExternalStorageDirectory();
+            configObserver = new android.os.FileObserver(sdcardDir.getAbsolutePath(),
+                    android.os.FileObserver.CLOSE_WRITE | android.os.FileObserver.MOVED_TO | android.os.FileObserver.MODIFY) {
+                @Override
+                public void onEvent(int event, String path) {
+                    if (path != null && path.equals(".launcherconfig")) {
+                        android.util.Log.i("GlassHome", ".launcherconfig updated on disk! Hot-reloading live...");
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                updateClockFormats();
+                                startPhotoRotation();
+                            }
+                        });
+                    }
+                }
+            };
+            configObserver.startWatching();
+            android.util.Log.i("GlassHome", "Live config FileObserver watching /sdcard/.launcherconfig");
+        } catch (Throwable t) {
+            android.util.Log.w("GlassHome", "Could not start FileObserver on .launcherconfig", t);
+        }
+    }
+
+    void loadConfigFile() {
+        File cfg = new File("/sdcard/.launcherconfig");
+        if (!cfg.exists()) {
+            File fallback = new File(getExternalFilesDir(null), ".launcherconfig");
+            if (fallback.exists()) {
+                cfg = fallback;
+            } else {
+                createDefaultConfigFile(cfg);
+            }
+        }
+        if (!cfg.exists() || !cfg.canRead()) return;
+
+        try {
+            BufferedReader r = new BufferedReader(new FileReader(cfg));
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int eq = line.indexOf('=');
+                if (eq <= 0) continue;
+                String key = line.substring(0, eq).trim().toLowerCase();
+                String val = line.substring(eq + 1).trim();
+                if (key.equals("device_name") || key.equals("device") || key.equals("name")) {
+                    deviceName = val;
+                } else if (key.equals("timezone_left") || key.equals("tz_left")) {
+                    if (val.length() > 0) tzLeft = val;
+                } else if (key.equals("timezone_left_tag") || key.equals("tz_left_tag")) {
+                    if (val.length() > 0) tzLeftTag = val;
+                } else if (key.equals("timezone_right") || key.equals("tz_right")) {
+                    if (val.length() > 0) tzRight = val;
+                } else if (key.equals("timezone_right_tag") || key.equals("tz_right_tag")) {
+                    if (val.length() > 0) tzRightTag = val;
+                } else if (key.equals("clock_24h") || key.equals("is_24h")) {
+                    boolean b = val.equalsIgnoreCase("true") || val.equals("1");
+                    prefs.edit().putBoolean("clock_24h", b).apply();
+                } else if (key.equals("screensaver_watchdog") || key.equals("inactivity_watchdog")
+                        || key.equals("idle_return_home") || key.equals("watchdog_enabled")) {
+                    boolean b = val.equalsIgnoreCase("true") || val.equals("1");
+                    prefs.edit().putBoolean("screensaver_watchdog", b).apply();
+                } else if (key.equals("inactivity_timeout") || key.equals("timeout")) {
+                    try { watchdogTimeout = Integer.parseInt(val); } catch (Exception e) {}
+                    prefs.edit().putInt("watchdog_timeout", watchdogTimeout).apply();
+                } else if (key.equals("webdav_url") || key.equals("url")) {
+                    webdavUrl = val;
+                } else if (key.equals("webdav_folder") || key.equals("folder")) {
+                    webdavFolder = val;
+                } else if (key.equals("webdav_user") || key.equals("user") || key.equals("username")) {
+                    webdavUser = val;
+                } else if (key.equals("webdav_password") || key.equals("password") || key.equals("pass")) {
+                    webdavPass = val;
+                } else if (key.equals("webdav_refresh_interval") || key.equals("refresh_interval") || key.equals("interval")) {
+                    try { webdavRefreshInterval = Integer.parseInt(val); } catch (Exception e) {}
+                } else if (key.equals("webdav_recursive") || key.equals("recursive")) {
+                    webdavRecursive = val.equalsIgnoreCase("true") || val.equals("1");
+                } else if (key.equals("wallpaper_glow_enabled") || key.equals("glow_enabled") || key.equals("glow")) {
+                    wallpaperGlowEnabled = val.equalsIgnoreCase("true") || val.equals("1");
+                } else if (key.equals("shelf_autohide") || key.equals("autohide_shelf") || key.equals("autohide")) {
+                    shelfAutohide = !"false".equalsIgnoreCase(val) && !val.equals("0");
+                } else if (key.equals("shelf_hide_timeout") || key.equals("hide_timeout")) {
+                    try { shelfHideTimeout = Integer.parseInt(val); } catch (Exception e) {}
+                }
+            }
+            r.close();
+        } catch (Exception e) {
+            android.util.Log.e("GlassHome", "Failed to read .launcherconfig", e);
+        }
+    }
+
+    void createDefaultConfigFile(File f) {
+        try {
+            PrintWriter pw = new PrintWriter(f);
+            pw.println("# Glass Home Launcher Configuration");
+            pw.println("# Modify settings here or push via ADB: adb push .launcherconfig /sdcard/.launcherconfig");
+            pw.println("");
+            pw.println("# Device Name (displayed to the left of the clocks)");
+            pw.println("device_name=NVIDIA AndroidTV");
+            pw.println("");
+            pw.println("# Left Timezone (default: CST America/Chicago)");
+            pw.println("timezone_left=America/Chicago");
+            pw.println("timezone_left_tag=CST");
+            pw.println("");
+            pw.println("# Right Timezone (default: IST Asia/Kolkata)");
+            pw.println("timezone_right=Asia/Kolkata");
+            pw.println("timezone_right_tag=IST");
+            pw.println("");
+            pw.println("# Clock 24h format (true or false)");
+            pw.println("clock_24h=false");
+            pw.println("");
+            pw.println("# Return to Home when idle without video to trigger screensaver (true or false)");
+            pw.println("screensaver_watchdog=true");
+            pw.println("");
+            pw.println("# Inactivity timeout in seconds before returning to Home (default: 300 for 5 min)");
+            pw.println("inactivity_timeout=300");
+            pw.close();
+        } catch (Exception e) { }
     }
 
     @Override
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
-        // HOME pressed while already home: go back to the dock, keep the last dock tile.
-        if (visible) { closeDropdown(); zone = DOCK; focusCurrent(true); }
+        updateClockFormats();
+        showShelf(true);
+        goToFirstApp(true);
     }
 
     @Override
     protected void onDestroy() {
+        if (configObserver != null) {
+            try { configObserver.stopWatching(); } catch (Exception e) {}
+            configObserver = null;
+        }
         try { unregisterReceiver(pkgReceiver); } catch (Exception e) { }
-        try { unregisterReceiver(netReceiver); } catch (Exception e) { }
-        try { unregisterReceiver(sysReceiver); } catch (Exception e) { }
-        try { getContentResolver().unregisterContentObserver(audioObserver); } catch (Exception e) { }
-        try { unregisterReceiver(screenReceiver); } catch (Exception e) { }
+        stopPhotoRotation();
+        photoExecutor.shutdownNow();
         handler.removeCallbacksAndMessages(null);
-        netThread.quitSafely();
         super.onDestroy();
     }
 
     @Override
-    public void onBackPressed() { /* launcher: never finish */ }
+    public void onBackPressed() {
+        if (reorderMode) {
+            toggleReorderMode();
+            return;
+        }
+        if (shelfIdx != 2) {
+            goToFirstApp(true);
+        }
+    }
 
     Typeface font(String n) {
         try { return Typeface.createFromAsset(getAssets(), "fonts/" + n); }
@@ -241,97 +508,143 @@ public class HomeActivity extends Activity {
 
     void buildUi() {
         root = new FrameLayout(this);
-        // midnight blue (top-left) fading to black (bottom-right); a static drawable, no animation
         GradientDrawable bgGrad = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0xFF14213D, 0xFF0A1022, 0xFF03050B, 0xFF000000});
+                new int[]{0xFF05070E, 0xFF020408, 0xFF000000, 0xFF000000});
         root.setBackground(bgGrad);
         root.setClipChildren(false);
 
-        // optional wallpaper (pitch black when absent)
-        File wp = new File(getExternalFilesDir(null), "wallpaper.jpg");
-        if (!wp.exists()) wp = new File(getExternalFilesDir(null), "wallpaper.png");
-        if (wp.exists()) {
-            Bitmap bm = decodeScaled(wp, 1920);
-            if (bm != null) {
-                ImageView iv = new ImageView(this);
-                iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                iv.setImageBitmap(bm);
-                iv.setColorFilter(0x80000000);
-                root.addView(iv, new FrameLayout.LayoutParams(-1, -1));
-            }
-        }
+        // --- Layer 1 & 2: Dual-Buffer Ambient Glow ---
+        glowA = new ImageView(this);
+        glowA.setScaleType(ImageView.ScaleType.FIT_XY);
+        glowA.setAlpha(0f);
+        root.addView(glowA, new FrameLayout.LayoutParams(-1, -1));
 
-        pane = new Pane(this);
-        root.addView(pane, new FrameLayout.LayoutParams(-1, -1));
+        glowB = new ImageView(this);
+        glowB.setScaleType(ImageView.ScaleType.FIT_XY);
+        glowB.setAlpha(0f);
+        root.addView(glowB, new FrameLayout.LayoutParams(-1, -1));
+
+        // --- Layer 3 & 4: Dual-Buffer Uncropped Photos (FIT_CENTER) ---
+        photoA = new ImageView(this);
+        photoA.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        photoA.setAlpha(1f);
+        root.addView(photoA, new FrameLayout.LayoutParams(-1, -1));
+
+        photoB = new ImageView(this);
+        photoB.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        photoB.setAlpha(0f);
+        root.addView(photoB, new FrameLayout.LayoutParams(-1, -1));
+
+        // Initial default wallpaper from bundled assets (wallpaper0001.jpg)
+        loadDefaultAssetWallpaper();
+
+        // --- Layer 5: Bottom Vignette Overlay (ensures shelf and clocks stay crisp & legible) ---
+        View bottomVignette = new View(this);
+        GradientDrawable vig = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x00000000, 0x55000000, 0xBB000000, 0xEE000000});
+        bottomVignette.setBackground(vig);
+        FrameLayout.LayoutParams vlp = new FrameLayout.LayoutParams(-1, px(200));
+        vlp.gravity = Gravity.BOTTOM;
+        root.addView(bottomVignette, vlp);
+
         content = new FrameLayout(this);
         content.setClipChildren(false);
-        pane.addView(content);
+        root.addView(content, new FrameLayout.LayoutParams(-1, -1));
 
-        // ambient glow behind the dock
-        glow = new View(this);
-        glowDrawable = new GradientDrawable();
-        glowDrawable.setGradientType(GradientDrawable.RADIAL_GRADIENT);
-        glowDrawable.setGradientRadius(px(330));
-        glowDrawable.setGradientCenter(0.5f, 0.5f);
-        setGlowColor(glowColor);
-        glow.setBackground(glowDrawable);
-        content.addView(glow, lp(1200, 720, -120, BAND_Y + BAND_H / 2 - 360));
+        // Dual Timezones: CST and IST side-by-side, IST to the right of CST
+        boolean is24 = prefs.getBoolean("clock_24h", false);
+        String tf = is24 ? "H:mm" : "h:mm a";
 
-        // top-left: greeting, clock, date
-        LinearLayout clockBox = new LinearLayout(this);
-        clockBox.setOrientation(LinearLayout.VERTICAL);
-        clockBox.setGravity(Gravity.LEFT);
-        greeting = text(17, fReg, 0x99FFFFFF);
-        clockBox.addView(greeting);
-        LinearLayout timeRow = new LinearLayout(this);
+        timeRow = new LinearLayout(this);
         timeRow.setOrientation(LinearLayout.HORIZONTAL);
-        timeRow.setBaselineAligned(true);          // AM/PM sits on the clock's baseline
-        TextClock clock = new TextClock(this);
-        clock.setFormat12Hour("hh:mm"); clock.setFormat24Hour("HH:mm");
-        styleText(clock, 104, fThin, 0xFFFFFFFF);
-        clock.setLetterSpacing(-0.01f);
-        timeRow.addView(clock);
-        TextClock ampm = new TextClock(this);
-        ampm.setFormat12Hour("a"); ampm.setFormat24Hour("");   // hidden in 24-hour mode
-        styleText(ampm, 18, fLight, 0x99FFFFFF);
-        ampm.setAllCaps(true);
-        ampm.setLetterSpacing(0.06f);
-        LinearLayout.LayoutParams apl = new LinearLayout.LayoutParams(-2, -2);
-        apl.leftMargin = px(8);
-        timeRow.addView(ampm, apl);
-        clockBox.addView(timeRow);
-        TextClock date = new TextClock(this);
-        date.setFormat12Hour("EEEE, d MMMM"); date.setFormat24Hour("EEEE, d MMMM");
-        styleText(date, 20, fLight, 0xB3FFFFFF);
-        clockBox.addView(date);
-        FrameLayout clockArea = new FrameLayout(this);
-        clockArea.addView(clockBox, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_VERTICAL | Gravity.LEFT));
-        content.addView(clockArea, lp(WX - SIDE - 24, WBOTTOM - WY, SIDE, WY));
+        timeRow.setGravity(Gravity.CENTER_VERTICAL);
 
+        // --- Device Name (to the left of both times) ---
+        deviceNameView = text(13.5f, fMed, 0xE6FFFFFF);
+        deviceNameView.setText(deviceName != null ? deviceName : "");
+        timeRow.addView(deviceNameView);
 
-        // focused dock app name above the dock
-        appName = text(46, fLight, 0xF2FFFFFF);
-        appName.setSingleLine(true);
-        appName.setMaxWidth(px(WX - SIDE - 24));
-        appName.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        appName.setShadowLayer(px(18), 0, 0, 0x55000000);
-        FrameLayout.LayoutParams al = lpWrap(SIDE + 4, 0);
-        al.gravity = Gravity.TOP | Gravity.LEFT;
-        al.topMargin = px(BAND_Y - 74);
-        // app name is shown under the focused dock tile, so the big title is not added to the layout
+        deviceSpacer = new View(this);
+        LinearLayout.LayoutParams dslp = new LinearLayout.LayoutParams(px(24), 1);
+        timeRow.addView(deviceSpacer, dslp);
 
-        // dock band
-        View band = new View(this);
-        GradientDrawable bd = new GradientDrawable();
-        bd.setCornerRadius(px(28));
-        bd.setColor(0x14FFFFFF);
-        bd.setStroke(Math.max(1, px(0.75f)), 0x14FFFFFF);
-        band.setBackground(bd);
-        content.addView(band, lp(960 - 2 * SIDE, BAND_H, SIDE, BAND_Y));
+        if (deviceName == null || deviceName.trim().isEmpty()) {
+            deviceNameView.setVisibility(View.GONE);
+            deviceSpacer.setVisibility(View.GONE);
+        }
 
-        buildTopBar();
+        // --- Left Timezone ---
+        LinearLayout cstBlock = new LinearLayout(this);
+        cstBlock.setOrientation(LinearLayout.HORIZONTAL);
+        cstBlock.setGravity(Gravity.CENTER_VERTICAL);
 
-        // overlay layer: glass highlight + inputs dropdown (not scrolled)
+        cstTag = text(12.5f, fBold, 0xCC38BDF8);
+        cstTag.setText(tzLeftTag);
+        cstBlock.addView(cstTag);
+
+        clockCst = new TextClock(this);
+        clockCst.setTimeZone(tzLeft);
+        clockCst.setFormat12Hour(tf);
+        clockCst.setFormat24Hour(tf);
+        styleText(clockCst, 17, fMed, 0xFFFFFFFF);
+        LinearLayout.LayoutParams clp1 = new LinearLayout.LayoutParams(-2, -2);
+        clp1.leftMargin = px(8);
+        cstBlock.addView(clockCst, clp1);
+
+        TextClock dateCst = new TextClock(this);
+        dateCst.setTimeZone(tzLeft);
+        dateCst.setFormat12Hour("·  EEE, d MMM");
+        dateCst.setFormat24Hour("·  EEE, d MMM");
+        styleText(dateCst, 12.5f, fLight, 0x99FFFFFF);
+        LinearLayout.LayoutParams dlp1 = new LinearLayout.LayoutParams(-2, -2);
+        dlp1.leftMargin = px(8);
+        cstBlock.addView(dateCst, dlp1);
+
+        timeRow.addView(cstBlock);
+
+        // --- Divider Spacer ---
+        View spacer = new View(this);
+        LinearLayout.LayoutParams splp = new LinearLayout.LayoutParams(px(24), 1);
+        timeRow.addView(spacer, splp);
+
+        // --- Right Timezone (to the right of Left Timezone) ---
+        LinearLayout istBlock = new LinearLayout(this);
+        istBlock.setOrientation(LinearLayout.HORIZONTAL);
+        istBlock.setGravity(Gravity.CENTER_VERTICAL);
+
+        istTag = text(12.5f, fBold, 0xCC34D399);
+        istTag.setText(tzRightTag);
+        istBlock.addView(istTag);
+
+        clockIst = new TextClock(this);
+        clockIst.setTimeZone(tzRight);
+        clockIst.setFormat12Hour(tf);
+        clockIst.setFormat24Hour(tf);
+        styleText(clockIst, 17, fMed, 0xFFFFFFFF);
+        LinearLayout.LayoutParams clp2 = new LinearLayout.LayoutParams(-2, -2);
+        clp2.leftMargin = px(8);
+        istBlock.addView(clockIst, clp2);
+
+        TextClock dateIst = new TextClock(this);
+        dateIst.setTimeZone(tzRight);
+        dateIst.setFormat12Hour("·  EEE, d MMM");
+        dateIst.setFormat24Hour("·  EEE, d MMM");
+        styleText(dateIst, 12.5f, fLight, 0x99FFFFFF);
+        LinearLayout.LayoutParams dlp2 = new LinearLayout.LayoutParams(-2, -2);
+        dlp2.leftMargin = px(8);
+        istBlock.addView(dateIst, dlp2);
+
+        timeRow.addView(istBlock);
+
+        // Add timeRow docked at bottom of screen
+        content.addView(timeRow, lpWrap(SIDE, TIME_Y));
+
+        // Horizontally scrolling row container for ALL shelf items (Gemini, Sleep, Apps)
+        shelfContainer = new FrameLayout(this);
+        shelfContainer.setClipChildren(false);
+        content.addView(shelfContainer, lpWrap(0, ROW_Y));
+
+        // Overlay layer: selection outline
         overlay = new FrameLayout(this);
         overlay.setClipChildren(false);
         root.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
@@ -340,37 +653,6 @@ public class HomeActivity extends Activity {
         overlay.addView(glass, new FrameLayout.LayoutParams(1, 1));
 
         setContentView(root);
-    }
-
-    View pill(final int idx, Drawable icon, String label) {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.HORIZONTAL);
-        p.setGravity(Gravity.CENTER_VERTICAL);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(px(20));
-        bg.setColor(0x24FFFFFF);
-        bg.setStroke(Math.max(1, px(0.75f)), 0x1FFFFFFF);
-        p.setBackground(bg);
-        p.setPadding(px(label == null ? 11 : 15), 0, px(label == null ? 11 : 17), 0);
-        ImageView iv = new ImageView(this);
-        iv.setImageDrawable(icon);
-        iv.setAlpha(0.8f);
-        p.addView(iv, new LinearLayout.LayoutParams(px(18), px(18)));
-        if (label != null) {
-            TextView t = text(15, fReg, 0xCCFFFFFF);
-            t.setText(label);
-            t.setSingleLine(true);
-            t.setMaxWidth(px(170));
-            t.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
-            tl.leftMargin = px(8);
-            p.addView(t, tl);
-            pillText[idx] = t;
-        }
-        LinearLayout.LayoutParams l = new LinearLayout.LayoutParams(label == null ? px(40) : -2, px(40));
-        if (idx > 0) l.leftMargin = px(12);
-        pillRow.addView(p, l);
-        return p;
     }
 
     TextView text(float sp, Typeface tf, int color) {
@@ -400,113 +682,198 @@ public class HomeActivity extends Activity {
         return l;
     }
 
-    Tile makeTile(App a, float x, float y) {
-        final Tile t = new Tile();
-        t.app = a; t.x = x; t.y = y;
-        t.card = new FrameLayout(this);
+    // ------------------------------------------------------------------ apps discovery & single shelf
+
+    void loadApps() {
+        for (ShelfItem item : shelfItems) shelfContainer.removeView(item.card);
+        shelfItems.clear();
+        apps.clear();
+        scaledItem = null;
+
+        HashSet<String> seen = new HashSet<String>();
+        HashMap<String, App> byPkg = new HashMap<String, App>();
+
+        // 1. Leanback activities
+        Intent qLean = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        addResolves(pm.queryIntentActivities(qLean, 0), byPkg, seen);
+
+        // 2. Standard activities (sideloaded apps)
+        Intent qStd = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        addResolves(pm.queryIntentActivities(qStd, 0), byPkg, seen);
+
+        // 3. Android TV Info category
+        Intent qInfo = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_INFO);
+        addResolves(pm.queryIntentActivities(qInfo, 0), byPkg, seen);
+
+        // 4. Query all installed applications for any valid launch intent
+        try {
+            List<ApplicationInfo> allApps = pm.getInstalledApplications(0);
+            if (allApps != null) {
+                for (ApplicationInfo ai : allApps) {
+                    if (seen.contains(ai.packageName) || HIDDEN.contains(ai.packageName)) continue;
+                    Intent li = pm.getLeanbackLaunchIntentForPackage(ai.packageName);
+                    if (li == null) li = pm.getLaunchIntentForPackage(ai.packageName);
+                    if (li != null) {
+                        List<ResolveInfo> riList = pm.queryIntentActivities(li, 0);
+                        if (riList != null && !riList.isEmpty()) {
+                            addResolves(riList, byPkg, seen);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) { }
+
+        // Load saved order
+        for (String pkg : readAppOrder()) {
+            App a = byPkg.remove(pkg);
+            if (a != null) apps.add(a);
+        }
+
+        // Remaining apps sorted alphabetically A-Z
+        ArrayList<App> remaining = new ArrayList<App>(byPkg.values());
+        Collections.sort(remaining, new Comparator<App>() {
+            public int compare(App x, App y) { return x.label.compareToIgnoreCase(y.label); }
+        });
+        apps.addAll(remaining);
+
+        rebuildShelf();
+    }
+
+    void addResolves(List<ResolveInfo> list, HashMap<String, App> byPkg, HashSet<String> seen) {
+        if (list == null) return;
+        for (ResolveInfo ri : list) {
+            String pkg = ri.activityInfo.packageName;
+            if (HIDDEN.contains(pkg) || seen.contains(pkg)) continue;
+            seen.add(pkg);
+            App a = new App();
+            a.pkg = pkg;
+            a.ri = ri;
+            CharSequence lbl = ri.loadLabel(pm);
+            if (lbl == null || lbl.length() == 0) lbl = ri.activityInfo.applicationInfo.loadLabel(pm);
+            a.label = lbl == null ? pkg : lbl.toString().trim();
+            Drawable bn = ri.activityInfo.loadBanner(pm);
+            if (bn == null) bn = ri.activityInfo.applicationInfo.loadBanner(pm);
+            if (bn != null) { a.banner = bn; a.isBanner = true; }
+            else {
+                Drawable ic = ri.loadIcon(pm);
+                if (ic == null) ic = ri.activityInfo.applicationInfo.loadIcon(pm);
+                a.banner = ic;
+                a.isBanner = false;
+            }
+            byPkg.put(pkg, a);
+        }
+    }
+
+    void rebuildShelf() {
+        for (ShelfItem item : shelfItems) shelfContainer.removeView(item.card);
+        shelfItems.clear();
+        scaledItem = null;
+
+        float curX = SIDE;
+
+        // 1. GEMINI / ASSISTANT BUTTON (far left of row)
+        ShelfItem geminiItem = makeActionTile(TYPE_GEMINI, new Icon(Icon.GEMINI), "Gemini", curX, ACTION_W_GEMINI);
+        shelfItems.add(geminiItem);
+        curX += ACTION_W_GEMINI + GAP;
+
+        // 2. SLEEP BUTTON (right of Gemini)
+        ShelfItem sleepItem = makeActionTile(TYPE_SLEEP, new Icon(Icon.SLEEP), "Sleep", curX, ACTION_W_SLEEP);
+        shelfItems.add(sleepItem);
+        curX += ACTION_W_SLEEP + GAP;
+
+        // 3. ALL APPS IN 1 COMPACT ROW (index 2 onwards)
+        for (int i = 0; i < apps.size(); i++) {
+            ShelfItem appItem = makeAppTile(apps.get(i), curX, APP_TILE_W);
+            shelfItems.add(appItem);
+            curX += APP_TILE_W + GAP;
+        }
+
+        shelfIdx = clamp(shelfIdx, 0, Math.max(0, shelfItems.size() - 1));
+
+        root.post(new Runnable() { public void run() { focusCurrent(false); } });
+    }
+
+    ShelfItem makeActionTile(final int type, Drawable icon, String label, float x, float w) {
+        final ShelfItem item = new ShelfItem();
+        item.type = type; item.x = x; item.width = w;
+        item.card = new FrameLayout(this);
+
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setCornerRadius(px(22));
+        cbg.setColor(type == TYPE_GEMINI ? 0xFF121B28 : 0xFF141923);
+        cbg.setStroke(px(1f), type == TYPE_GEMINI ? 0x4D38BDF8 : 0x2E64748B);
+        item.card.setBackground(cbg);
+        item.card.setOutlineProvider(new ViewOutlineProvider() {
+            public void getOutline(View v, Outline o) { o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), px(22)); }
+        });
+        item.card.setClipToOutline(true);
+
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.HORIZONTAL);
+        ll.setGravity(Gravity.CENTER);
+        ll.setPadding(px(12), 0, px(14), 0);
+
+        ImageView iv = new ImageView(this);
+        iv.setImageDrawable(icon);
+        ll.addView(iv, new LinearLayout.LayoutParams(px(18), px(18)));
+
+        TextView n = text(13.5f, fMed, type == TYPE_GEMINI ? 0xFF38BDF8 : 0xCCFFFFFF);
+        n.setText(label);
+        n.setSingleLine(true);
+        LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(-2, -2);
+        nl.leftMargin = px(8);
+        ll.addView(n, nl);
+
+        item.card.addView(ll, new FrameLayout.LayoutParams(-1, -1));
+
+        FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(px(w), px(ROW_H));
+        cl.leftMargin = px(x);
+        cl.gravity = Gravity.TOP | Gravity.LEFT;
+        shelfContainer.addView(item.card, cl);
+
+        return item;
+    }
+
+    ShelfItem makeAppTile(App a, float x, float w) {
+        final ShelfItem item = new ShelfItem();
+        item.type = TYPE_APP; item.app = a; item.x = x; item.width = w;
+        item.card = new FrameLayout(this);
+
         GradientDrawable cbg = new GradientDrawable();
         cbg.setCornerRadius(px(10));
         cbg.setColor(0xFF1C1C1F);
-        t.card.setBackground(cbg);
-        t.card.setOutlineProvider(new ViewOutlineProvider() {
+        item.card.setBackground(cbg);
+        item.card.setOutlineProvider(new ViewOutlineProvider() {
             public void getOutline(View v, Outline o) { o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), px(10)); }
         });
-        t.card.setClipToOutline(true);
+        item.card.setClipToOutline(true);
+
         if (a.isBanner) {
             ImageView iv = new ImageView(this);
             iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
             iv.setImageDrawable(a.banner);
-            t.card.addView(iv, new FrameLayout.LayoutParams(-1, -1));
+            item.card.addView(iv, new FrameLayout.LayoutParams(-1, -1));
         } else {
-            // no banner: icon + name on a dark card
-            LinearLayout ll = new LinearLayout(this);
-            ll.setOrientation(LinearLayout.VERTICAL);
-            ll.setGravity(Gravity.CENTER);
             ImageView iv = new ImageView(this);
+            iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
             iv.setImageDrawable(a.banner);
-            ll.addView(iv, new LinearLayout.LayoutParams(px(44), px(44)));
-            TextView n = text(13, fReg, 0xCCFFFFFF);
-            n.setText(a.label);
-            n.setSingleLine(true);
-            n.setPadding(px(8), px(8), px(8), 0);
-            ll.addView(n);
-            t.card.addView(ll, new FrameLayout.LayoutParams(-1, -1));
+            FrameLayout.LayoutParams il = new FrameLayout.LayoutParams(px(28), px(28));
+            il.gravity = Gravity.CENTER;
+            item.card.addView(iv, il);
         }
-        content.addView(t.card, lp(TILE_W, TILE_H, x, y));
-        t.label = text(14, fReg, 0xEBFFFFFF);
-        t.label.setText(a.label);
-        t.label.setGravity(Gravity.CENTER);
-        t.label.setSingleLine(true);
-        t.label.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        t.label.setAlpha(0f);
-        content.addView(t.label, lp(TILE_W + 20, LABEL_H, x - 10, y + TILE_H + 9));
-        return t;
+
+        FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(px(w), px(ROW_H));
+        cl.leftMargin = px(x);
+        cl.gravity = Gravity.TOP | Gravity.LEFT;
+        shelfContainer.addView(item.card, cl);
+
+        return item;
     }
 
-    // ------------------------------------------------------------------ apps
-
-    void loadApps() {
-        // remove old tiles
-        for (Tile t : dockTiles) { content.removeView(t.card); content.removeView(t.label); }
-        for (Tile t : gridTiles) { content.removeView(t.card); content.removeView(t.label); }
-        for (View v : gridViews) content.removeView(v);
-        dockTiles.clear(); gridTiles.clear(); gridViews.clear(); dockApps.clear(); gridApps.clear();
-        scaledTile = null;
-
-        Intent q = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-        List<ResolveInfo> list = pm.queryIntentActivities(q, 0);
-        HashMap<String, App> byPkg = new HashMap<String, App>();
-        for (ResolveInfo ri : list) {
-            String pkg = ri.activityInfo.packageName;
-            if (HIDDEN.contains(pkg) || byPkg.containsKey(pkg)) continue;
-            App a = new App();
-            a.pkg = pkg; a.ri = ri;
-            a.label = String.valueOf(ri.loadLabel(pm)).trim();
-            Drawable bn = ri.activityInfo.loadBanner(pm);
-            if (bn == null) bn = ri.activityInfo.applicationInfo.loadBanner(pm);
-            if (bn != null) { a.banner = bn; a.isBanner = true; }
-            else { a.banner = ri.loadIcon(pm); a.isBanner = false; }
-            byPkg.put(pkg, a);
-        }
-        for (String pkg : readDock()) {
-            App a = byPkg.remove(pkg);
-            if (a != null && dockApps.size() < 4) dockApps.add(a);
-        }
-        gridApps.addAll(byPkg.values());
-        Collections.sort(gridApps, new Comparator<App>() {
-            public int compare(App x, App y) { return x.label.compareToIgnoreCase(y.label); }
-        });
-
-        // dock tiles, evenly spaced inside the band
-        float inner = 960 - 2 * SIDE - 2 * BAND_PAD;
-        float gap = (inner - COLS * TILE_W) / (COLS - 1);
-        float x0 = SIDE + BAND_PAD;
-        for (int i = 0; i < dockApps.size(); i++)
-            dockTiles.add(makeTile(dockApps.get(i), x0 + i * (TILE_W + gap), BAND_Y + BAND_PAD));
-
-        // grid
-        TextView hdr = text(16, fMed, 0x80FFFFFF);
-        hdr.setText("All apps");
-        hdr.setLetterSpacing(0.04f);
-        content.addView(hdr, lpWrap(x0 + 2, GRID_TOP - 34));
-        gridViews.add(hdr);
-        for (int i = 0; i < gridApps.size(); i++)
-            gridTiles.add(makeTile(gridApps.get(i), x0 + (i % COLS) * (TILE_W + gap), GRID_TOP + (i / COLS) * ROW_PITCH));
-        int rows = (gridApps.size() + COLS - 1) / COLS;
-        float h = Math.max(540, GRID_TOP + rows * ROW_PITCH + 30);
-        content.setLayoutParams(new ViewGroup.LayoutParams(-1, px(h)));
-
-        // keep glass on top of tiles, clamp remembered indices
-        dockIdx = clamp(dockIdx, 0, Math.max(0, dockTiles.size() - 1));
-        gridIdx = clamp(gridIdx, 0, Math.max(0, gridTiles.size() - 1));
-        if (zone == GRID && gridTiles.isEmpty()) zone = DOCK;
-        if (zone == DOCK && dockTiles.isEmpty()) zone = gridTiles.isEmpty() ? TOP : GRID;
-        root.post(new Runnable() { public void run() { focusCurrent(false); } });
-    }
-
-    List<String> readDock() {
+    List<String> readAppOrder() {
         ArrayList<String> out = new ArrayList<String>();
-        File f = new File(getExternalFilesDir(null), "dock.txt");
+        File f = new File(getExternalFilesDir(null), "apps_order.txt");
+        if (!f.exists()) f = new File(getExternalFilesDir(null), "dock.txt");
         if (f.exists()) {
             try {
                 BufferedReader r = new BufferedReader(new FileReader(f));
@@ -522,66 +889,149 @@ public class HomeActivity extends Activity {
         return out;
     }
 
-    // ------------------------------------------------------------------ focus model
+    void saveAppOrder() {
+        try {
+            File f = new File(getExternalFilesDir(null), "apps_order.txt");
+            PrintWriter pw = new PrintWriter(f);
+            for (App a : apps) pw.println(a.pkg);
+            pw.close();
+        } catch (Exception e) { }
+        try {
+            File fd = new File(getExternalFilesDir(null), "dock.txt");
+            PrintWriter pw = new PrintWriter(fd);
+            for (App a : apps) pw.println(a.pkg);
+            pw.close();
+        } catch (Exception e) { }
+    }
+
+    void toggleReorderMode() {
+        if (shelfIdx < 2) return;
+        reorderMode = !reorderMode;
+        if (reorderMode) {
+            Toast.makeText(this, "✦ MOVE MODE: D-pad Left/Right to reorder, OK to save", Toast.LENGTH_SHORT).show();
+        } else {
+            saveAppOrder();
+            Toast.makeText(this, "App order saved", Toast.LENGTH_SHORT).show();
+        }
+        glass.invalidate();
+        focusCurrent(true);
+    }
+
+    void goToFirstApp(boolean animate) {
+        if (reorderMode) toggleReorderMode();
+        shelfIdx = (shelfItems.size() > 2) ? 2 : 0;
+        focusCurrent(animate);
+    }
+
+    // ------------------------------------------------------------------ focus & navigation
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
+        android.util.Log.d("GlassHome", "dispatchKeyEvent: code=" + e.getKeyCode() + " action=" + e.getAction());
         int k = e.getKeyCode();
+
         boolean center = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
                 || k == KeyEvent.KEYCODE_NUMPAD_ENTER || k == KeyEvent.KEYCODE_BUTTON_A;
         boolean nav = k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_DOWN
                 || k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT;
+
+        // Any key press resets the hide timer and wakes the shelf if hidden
+        resetShelfHideTimer();
+        if (isShelfHidden) {
+            showShelf(true);
+            if (e.getAction() == KeyEvent.ACTION_UP) {
+                return true;
+            }
+            // For DOWN action when waking up, consume event so accidental clicks/launches don't happen
+            if (k != KeyEvent.KEYCODE_HOME) {
+                return true;
+            }
+        }
+
+        if (k == KeyEvent.KEYCODE_HOME) {
+            if (e.getAction() == KeyEvent.ACTION_UP) {
+                goToFirstApp(true);
+            }
+            return true;
+        }
+
         if (k == KeyEvent.KEYCODE_BACK) {
             if (e.getAction() == KeyEvent.ACTION_UP) {
-                if (dropdownOpen) closeDropdown();
-                else if (zone != DOCK) { zone = DOCK; focusCurrent(true); }
+                if (reorderMode) { toggleReorderMode(); return true; }
+                if (shelfIdx != 2) {
+                    goToFirstApp(true);
+                }
             }
             return true;
         }
+
         if (center) {
             if (e.getAction() == KeyEvent.ACTION_DOWN) {
-                if (e.getRepeatCount() == 0) longPressed = false;
-                else if (!longPressed && e.getRepeatCount() >= 8) { longPressed = true; appInfo(); }
-            } else if (e.getAction() == KeyEvent.ACTION_UP && !longPressed) {
-                activate();
+                if (e.isLongPress() || (e.getFlags() & KeyEvent.FLAG_LONG_PRESS) != 0) {
+                    handler.removeCallbacks(longPressRunnable);
+                    longPressed = true;
+                    if (!reorderMode && shelfIdx >= 2) {
+                        toggleReorderMode();
+                    }
+                    return true;
+                }
+                if (e.getRepeatCount() == 0) {
+                    longPressed = false;
+                    handler.removeCallbacks(longPressRunnable);
+                    if (!reorderMode && shelfIdx >= 2) {
+                        handler.postDelayed(longPressRunnable, 500);
+                    }
+                } else if (!longPressed && !reorderMode && shelfIdx >= 2 && e.getRepeatCount() >= 4) {
+                    handler.removeCallbacks(longPressRunnable);
+                    longPressed = true;
+                    toggleReorderMode();
+                }
+            } else if (e.getAction() == KeyEvent.ACTION_UP) {
+                handler.removeCallbacks(longPressRunnable);
+                if (longPressed) {
+                    longPressed = false;
+                    return true;
+                }
+                if (reorderMode) {
+                    toggleReorderMode();
+                } else {
+                    activate();
+                }
             }
             return true;
         }
+
         if (!nav) return super.dispatchKeyEvent(e);
         if (e.getAction() != KeyEvent.ACTION_DOWN) return true;
-        if (dropdownOpen) { dropdownKey(k); return true; }
-        int n = gridTiles.size();
+        handler.removeCallbacks(longPressRunnable);
+
+        if (reorderMode) {
+            if (k == KeyEvent.KEYCODE_DPAD_LEFT && shelfIdx > 2) {
+                int appPos = shelfIdx - 2;
+                App temp = apps.get(appPos);
+                apps.set(appPos, apps.get(appPos - 1));
+                apps.set(appPos - 1, temp);
+                shelfIdx--;
+                rebuildShelf();
+                return true;
+            } else if (k == KeyEvent.KEYCODE_DPAD_RIGHT && shelfIdx < shelfItems.size() - 1) {
+                int appPos = shelfIdx - 2;
+                App temp = apps.get(appPos);
+                apps.set(appPos, apps.get(appPos + 1));
+                apps.set(appPos + 1, temp);
+                shelfIdx++;
+                rebuildShelf();
+                return true;
+            }
+            return true;
+        }
+
         switch (k) {
-            case KeyEvent.KEYCODE_DPAD_UP:
-                if (zone == DOCK) zone = TOP;
-                else if (zone == GRID) {
-                    if (gridIdx < COLS) { if (!dockTiles.isEmpty()) { zone = DOCK; dockIdx = Math.min(gridIdx, dockTiles.size() - 1); } else zone = TOP; }
-                    else gridIdx -= COLS;
-                } else return true;   // top bar: nothing above
-                break;
-            case KeyEvent.KEYCODE_DPAD_DOWN:
-                if (zone == TOP) {
-                    if (!dockTiles.isEmpty()) zone = DOCK;
-                    else if (n > 0) { zone = GRID; gridIdx = 0; }
-                    else return true;
-                } else if (zone == DOCK) {
-                    if (n == 0) return true;
-                    zone = GRID; gridIdx = Math.min(dockIdx, n - 1);
-                } else {
-                    int row = gridIdx / COLS, lastRow = (n - 1) / COLS;
-                    if (row >= lastRow) return true;
-                    gridIdx = Math.min(gridIdx + COLS, n - 1);
-                }
-                break;
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                if (zone == TOP) { if (topIdx == 0) return true; topIdx--; }
-                else if (zone == DOCK) { if (dockIdx == 0) return true; dockIdx--; }
-                else { if (gridIdx % COLS == 0) return true; gridIdx--; }
+                if (shelfIdx > 0) shelfIdx--;
                 break;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                if (zone == TOP) { if (topIdx == pills.length - 1) return true; topIdx++; }
-                else if (zone == DOCK) { if (dockIdx >= dockTiles.size() - 1) return true; dockIdx++; }
-                else { if (gridIdx % COLS == COLS - 1 || gridIdx >= n - 1) return true; gridIdx++; }
+                if (shelfIdx < shelfItems.size() - 1) shelfIdx++;
                 break;
         }
         focusCurrent(true);
@@ -589,82 +1039,78 @@ public class HomeActivity extends Activity {
     }
 
     void focusCurrent(boolean animate) {
-        if (content.getWidth() == 0) return;
-        Tile tile = null;
+        if (root.getWidth() == 0 || shelfItems.isEmpty()) return;
+
         RectF target = new RectF();
-        float radius;
-        float trans;
-        if (zone == TOP) {
-            View p = pills[topIdx];
-            float[] o = offset(p, root);
-            target.set(o[0], o[1], o[0] + p.getWidth(), o[1] + p.getHeight());
-            target.inset(-px(2), -px(2));
-            radius = px(22);
-            trans = 0;
-        } else {
-            tile = zone == DOCK ? dockTiles.get(dockIdx) : gridTiles.get(gridIdx);
-            float w = px(TILE_W) * SCALE, h = px(TILE_H) * SCALE;
-            float cx = px(tile.x) + px(TILE_W) / 2f, cy = px(tile.y) + px(TILE_H) / 2f;
-            target.set(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
-            target.inset(-px(2.5f), -px(2.5f));
-            radius = px(13);
-            if (zone == DOCK) trans = 0;
-            else {
-                int row = gridIdx / COLS;
-                trans = -(px(GRID_TOP + row * ROW_PITCH) - px(GRID_FOCUS_Y));
-                float min = -(content.getHeight() - root.getHeight());
-                trans = Math.max(trans, Math.min(0, min));
-            }
-        }
-        target.offset(0, trans);
 
-        // pills
-        for (int i = 0; i < pills.length; i++) {
-            boolean f = zone == TOP && i == topIdx;
-            GradientDrawable bg = (GradientDrawable) pills[i].getBackground();
-            bg.setColor(f ? 0x40FFFFFF : 0x24FFFFFF);
-            if (pillText[i] != null) pillText[i].setTextColor(f ? 0xFFFFFFFF : 0xCCFFFFFF);
-            ((ViewGroup) pills[i]).getChildAt(0).setAlpha(f ? 1f : 0.8f);
-        }
-        // tiles: scale the focused one, show its name
-        if (scaledTile != null && scaledTile != tile) {
-            scaledTile.card.animate().scaleX(1f).scaleY(1f).setDuration(200).setInterpolator(new DecelerateInterpolator()).start();
-            scaledTile.label.animate().alpha(0f).setDuration(120).start();
-        }
-        if (tile != null && scaledTile != tile) {
-            tile.card.animate().scaleX(SCALE).scaleY(SCALE).setDuration(animate ? 320 : 0).setInterpolator(new OvershootInterpolator(1.6f)).start();
-            tile.label.animate().alpha(1f).setDuration(animate ? 180 : 0).start();
-        }
-        scaledTile = tile;
-        if (zone == DOCK && tile != null) showDockApp(tile.app, animate);
-        else if (zone == TOP && !dockTiles.isEmpty()) showDockApp(dockTiles.get(dockIdx).app, animate);
+        ShelfItem item = shelfItems.get(shelfIdx);
 
-        moveGlass(target, radius, trans, animate);
+        // Compute horizontal scroll translation for shelfContainer
+        float targetTransX = px(480) - px(item.x + item.width / 2f);
+        ShelfItem last = shelfItems.get(shelfItems.size() - 1);
+        float minTransX = px(960 - SIDE) - px(last.x + last.width);
+        if (minTransX > 0) minTransX = 0;
+        targetTransX = clamp(targetTransX, minTransX, 0f);
+
+        animateShelfScroll(targetTransX, animate);
+
+        float cardScreenX = px(item.x) + targetTransX;
+        float cardScreenY = px(ROW_Y);
+        float w = px(item.width) * SCALE, h = px(ROW_H) * SCALE;
+        float cx = cardScreenX + px(item.width) / 2f, cy = cardScreenY + px(ROW_H) / 2f;
+        target.set(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
+        target.inset(-px(2.5f), -px(2.5f));
+        float radius = (item.type == TYPE_APP) ? px(10) : px(22);
+
+        // Card scale
+        if (scaledItem != null && scaledItem != item) {
+            scaledItem.card.animate().scaleX(1f).scaleY(1f).setDuration(200).setInterpolator(new DecelerateInterpolator()).start();
+        }
+        if (scaledItem != item || reorderMode) {
+            item.card.animate().scaleX(SCALE).scaleY(SCALE).setDuration(animate ? 250 : 0).setInterpolator(new OvershootInterpolator(1.4f)).start();
+        }
+        scaledItem = item;
+
+        moveGlass(target, radius, animate);
     }
 
-    void moveGlass(final RectF to, final float toRadius, final float toTrans, boolean animate) {
+    void animateShelfScroll(float toTransX, boolean animate) {
+        if (scrollAnim != null) scrollAnim.cancel();
+        if (!animate) {
+            curShelfTransX = toTransX;
+            shelfContainer.setTranslationX(curShelfTransX);
+            return;
+        }
+        scrollAnim = ValueAnimator.ofFloat(curShelfTransX, toTransX);
+        scrollAnim.setDuration(280);
+        scrollAnim.setInterpolator(new DecelerateInterpolator());
+        scrollAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            public void onAnimationUpdate(ValueAnimator va) {
+                curShelfTransX = (Float) va.getAnimatedValue();
+                shelfContainer.setTranslationX(curShelfTransX);
+            }
+        });
+        scrollAnim.start();
+    }
+
+    void moveGlass(final RectF to, final float toRadius, boolean animate) {
         if (moveAnim != null) moveAnim.cancel();
         if (!animate || glassRect.isEmpty()) {
-            glassRect.set(to); glassRadius = toRadius; curTrans = toTrans;
-            content.setTranslationY(curTrans);
+            glassRect.set(to); glassRadius = toRadius;
             applyGlass();
             return;
         }
         final RectF from = new RectF(glassRect);
-        final float fromR = glassRadius, fromT = curTrans;
+        final float fromR = glassRadius;
         moveAnim = ValueAnimator.ofFloat(0f, 1f);
-        moveAnim.setDuration(440);
+        moveAnim.setDuration(280);
         moveAnim.setInterpolator(new Spring());
         moveAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-            public void onAnimationUpdate(ValueAnimator a) {
-                float t = (Float) a.getAnimatedValue();
+            public void onAnimationUpdate(ValueAnimator va) {
+                float t = (Float) va.getAnimatedValue();
                 glassRect.set(lerp(from.left, to.left, t), lerp(from.top, to.top, t),
                         lerp(from.right, to.right, t), lerp(from.bottom, to.bottom, t));
-                glassRadius = lerp(fromR, toRadius, Math.min(1f, t));
-                // scrolling uses the same spring but never overshoots past the target
-                float st = Math.min(1f, t);
-                curTrans = lerp(fromT, toTrans, st);
-                content.setTranslationY(curTrans);
+                glassRadius = lerp(fromR, toRadius, t);
                 applyGlass();
             }
         });
@@ -673,294 +1119,90 @@ public class HomeActivity extends Activity {
 
     void applyGlass() {
         FrameLayout.LayoutParams l = (FrameLayout.LayoutParams) glass.getLayoutParams();
+        int left = Math.round(glassRect.left), top = Math.round(glassRect.top);
         int w = Math.round(glassRect.width()), h = Math.round(glassRect.height());
-        if (l.width != w || l.height != h) { l.width = w; l.height = h; glass.setLayoutParams(l); }
-        topScrim.setAlpha(Math.max(0f, Math.min(1f, -curTrans / px(70))));
-        glass.setTranslationX(glassRect.left);
-        glass.setTranslationY(glassRect.top);
+        if (l.leftMargin != left || l.topMargin != top || l.width != w || l.height != h) {
+            l.leftMargin = left; l.topMargin = top;
+            l.width = w; l.height = h;
+            glass.setLayoutParams(l);
+        }
         ((Glass) glass.getBackground()).radius = glassRadius;
         glass.invalidate();
-    }
-
-    String shownPkg;
-    void showDockApp(App a, boolean animate) {
-        if (a.pkg.equals(shownPkg)) return;
-        shownPkg = a.pkg;
-        appName.setText(a.label);
-        if (animate) { appName.setAlpha(0f); appName.animate().alpha(1f).setDuration(220).start(); }
-        // glow follows the tile horizontally and takes the banner's colour
-        Tile t = dockTiles.get(dockIdx);
-        float cx = px(t.x + TILE_W / 2) - px(480);
-        int c = colorFor(a);
-        if (animate) {
-            glow.animate().translationX(cx).setDuration(500).setInterpolator(new DecelerateInterpolator()).start();
-            if (glowAnim != null) glowAnim.cancel();
-            glowAnim = ValueAnimator.ofObject(new ArgbEvaluator(), glowColor, c);
-            glowAnim.setDuration(500);
-            glowAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-                public void onAnimationUpdate(ValueAnimator va) { setGlowColor((Integer) va.getAnimatedValue()); }
-            });
-            glowAnim.start();
-        } else {
-            glow.setTranslationX(cx);
-            setGlowColor(c);
-        }
-    }
-
-    void setGlowColor(int c) {
-        glowColor = c;
-        int inner = (c & 0x00FFFFFF) | 0x66000000;
-        int mid = (c & 0x00FFFFFF) | 0x22000000;
-        glowDrawable.setColors(new int[]{inner, mid, 0x00000000});
-    }
-
-    int colorFor(App a) {
-        Integer cached = colorCache.get(a.pkg);
-        if (cached != null) return cached;
-        int out = 0xFF5A5A66;
-        try {
-            Bitmap b = Bitmap.createBitmap(32, 18, Bitmap.Config.ARGB_8888);
-            Canvas cv = new Canvas(b);
-            Drawable d = a.banner.getConstantState() != null ? a.banner.getConstantState().newDrawable().mutate() : a.banner;
-            d.setBounds(0, 0, 32, 18);
-            d.draw(cv);
-            float[] hsv = new float[3];
-            double r = 0, g = 0, bl = 0, wsum = 0;
-            for (int y = 0; y < 18; y++) for (int x = 0; x < 32; x++) {
-                int p = b.getPixel(x, y);
-                if (Color.alpha(p) < 128) continue;
-                Color.colorToHSV(p, hsv);
-                double w = hsv[1] * hsv[1] * hsv[2] + 0.002;
-                r += Color.red(p) * w; g += Color.green(p) * w; bl += Color.blue(p) * w; wsum += w;
-            }
-            b.recycle();
-            if (wsum > 0) {
-                int avg = Color.rgb((int) (r / wsum), (int) (g / wsum), (int) (bl / wsum));
-                Color.colorToHSV(avg, hsv);
-                if (hsv[1] > 0.12f) { hsv[1] = Math.max(hsv[1], 0.6f); hsv[2] = 0.9f; }
-                else { hsv[1] = 0f; hsv[2] = 0.55f; }
-                out = Color.HSVToColor(hsv);
-            }
-        } catch (Exception e) { }
-        colorCache.put(a.pkg, out);
-        return out;
     }
 
     // ------------------------------------------------------------------ actions
 
     void activate() {
-        if (dropdownOpen) { pickInput(); return; }
-        if (zone == TOP) {
-            if (topIdx == P_INPUTS) openDropdown(P_INPUTS);
-            else if (topIdx == P_WIFI) start(new Intent(Settings.ACTION_WIFI_SETTINGS));
-            else if (topIdx == P_AUDIO) openDropdown(P_AUDIO);
-            else start(new Intent(Settings.ACTION_SETTINGS));
+        if (shelfIdx < 0 || shelfIdx >= shelfItems.size()) return;
+        ShelfItem item = shelfItems.get(shelfIdx);
+        if (item.type == TYPE_GEMINI) {
+            triggerAssistant();
             return;
         }
-        Tile t = zone == DOCK ? dockTiles.get(dockIdx) : gridTiles.get(gridIdx);
-        Intent i = pm.getLeanbackLaunchIntentForPackage(t.app.pkg);
-        if (i == null) i = pm.getLaunchIntentForPackage(t.app.pkg);
-        if (i == null) {
-            i = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-            i.setClassName(t.app.ri.activityInfo.packageName, t.app.ri.activityInfo.name);
+        if (item.type == TYPE_SLEEP) {
+            triggerSleep();
+            return;
         }
-        start(i);
+
+        if (item.app != null) {
+            Intent i = pm.getLeanbackLaunchIntentForPackage(item.app.pkg);
+            if (i == null) i = pm.getLaunchIntentForPackage(item.app.pkg);
+            if (i == null && item.app.ri != null) {
+                i = new Intent(Intent.ACTION_MAIN);
+                i.setClassName(item.app.ri.activityInfo.packageName, item.app.ri.activityInfo.name);
+            }
+            if (i != null) start(i);
+            else Toast.makeText(this, "Can't launch " + item.app.label, Toast.LENGTH_SHORT).show();
+        }
     }
 
-    void appInfo() {
-        if (zone == TOP || dropdownOpen) return;
-        Tile t = zone == DOCK ? dockTiles.get(dockIdx) : gridTiles.get(gridIdx);
-        start(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + t.app.pkg)));
+    void triggerSleep() {
+        android.util.Log.i("GlassHome", "triggerSleep requested");
+        // Ensure accessibility service is prompted if it became inactive
+        boolean ok = InactivityWatchdogService.sleepDevice();
+        android.util.Log.i("GlassHome", "InactivityWatchdogService.sleepDevice result: " + ok);
+        if (!ok) {
+            boolean execSuccess = false;
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
+                p.waitFor();
+                execSuccess = (p.exitValue() == 0);
+            } catch (Exception ignored) {}
+
+            if (!execSuccess) {
+                try {
+                    Runtime.getRuntime().exec(new String[]{"input", "keyevent", "26"});
+                } catch (Exception ignored) {}
+            }
+            Toast.makeText(this, "Sleep requested (enable Accessibility for instant standby)", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    void triggerAssistant() {
+        try {
+            Intent ai = new Intent(Intent.ACTION_ASSIST);
+            ai.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(ai);
+        } catch (Exception e) {
+            try {
+                Intent vi = new Intent(Intent.ACTION_VOICE_COMMAND);
+                vi.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(vi);
+            } catch (Exception e2) {
+                Toast.makeText(this, "Assistant unavailable", Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 
     void start(Intent i) {
         try { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); }
-        catch (Exception e) { android.widget.Toast.makeText(this, "Can't open that", android.widget.Toast.LENGTH_SHORT).show(); }
+        catch (Exception e) { Toast.makeText(this, "Can't open that", Toast.LENGTH_SHORT).show(); }
     }
 
-    // ------------------------------------------------------------------ inputs dropdown
+    // ------------------------------------------------------------------ receivers
 
-    void loadInputs() {
-        inputs.clear();
-        ArrayList<TvInputInfo> hdmi = new ArrayList<TvInputInfo>();
-        TvInputInfo av = null;
-        try {
-            TvInputManager tim = (TvInputManager) getSystemService(Context.TV_INPUT_SERVICE);
-            for (TvInputInfo info : tim.getTvInputList()) {
-                if (!info.isPassthroughInput()) continue;
-                if (info.getType() == TvInputInfo.TYPE_HDMI) hdmi.add(info);
-                else if (info.getType() == TvInputInfo.TYPE_COMPOSITE && av == null) av = info;
-            }
-        } catch (Exception e) { }
-        Collections.sort(hdmi, new Comparator<TvInputInfo>() {
-            public int compare(TvInputInfo a, TvInputInfo b) { return Long.compare(hwId(a.getId()), hwId(b.getId())); }
-        });
-        for (int i = 0; i < hdmi.size(); i++) {
-            InputItem it = new InputItem();
-            it.id = hdmi.get(i).getId();
-            String l = customLabel(hdmi.get(i));
-            it.label = (l == null || l.length() == 0 || l.equalsIgnoreCase("HDMI")) ? "HDMI " + (i + 1) : l.replaceAll("^HDMI(\\d)$", "HDMI $1");
-            inputs.add(it);
-        }
-        if (av != null) { InputItem it = new InputItem(); it.id = av.getId(); it.label = "AV"; inputs.add(it); }
-        InputItem live = new InputItem(); live.liveTv = true; live.label = "Live TV"; inputs.add(live);
-    }
-
-    String customLabel(TvInputInfo info) {
-        try {
-            Object o = TvInputInfo.class.getMethod("loadCustomLabel", Context.class).invoke(info, this);
-            if (o != null && o.toString().length() > 0) return o.toString();
-        } catch (Exception e) { }
-        CharSequence l = info.loadLabel(this);
-        return l == null ? null : l.toString();
-    }
-
-    static long hwId(String id) {
-        int i = id.lastIndexOf("/HW");
-        try { return i >= 0 ? Long.parseLong(id.substring(i + 3)) : Long.MAX_VALUE; } catch (Exception e) { return Long.MAX_VALUE; }
-    }
-
-    void loadAudioItems() {
-        inputs.clear();
-        int cur = audioIndex();
-        for (int i = 0; i < AUDIO_NAMES.length; i++) {
-            if (i == 2 && cur != 2) continue;      // ARC only listed while the TV reports it in use
-            InputItem it = new InputItem();
-            it.audio = i; it.current = i == cur;
-            it.label = i == 1 ? "Optical (S/PDIF)" : AUDIO_NAMES[i];
-            inputs.add(it);
-        }
-    }
-
-    void openDropdown(int pillIdx) {
-        dropdownPill = pillIdx;
-        if (pillIdx == P_AUDIO) loadAudioItems(); else loadInputs();
-        inputRows.clear();
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(px(20));
-        bg.setColor(0xFF161A28);
-        bg.setStroke(Math.max(1, px(0.75f)), 0x2EFFFFFF);
-        panel.setBackground(bg);
-        panel.setPadding(px(6), px(6), px(6), px(6));
-        for (int i = 0; i < inputs.size(); i++) {
-            TextView row = text(16, fReg, 0xD9FFFFFF);
-            row.setText(inputs.get(i).current ? inputs.get(i).label + "   ✓" : inputs.get(i).label);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(px(16), 0, px(16), 0);
-            if (inputs.get(i).liveTv && i > 0) {
-                View div = new View(this);
-                div.setBackgroundColor(0x1FFFFFFF);
-                LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(-1, Math.max(1, px(0.75f)));
-                dl.setMargins(px(12), px(4), px(12), px(4));
-                panel.addView(div, dl);
-            }
-            panel.addView(row, new LinearLayout.LayoutParams(-1, px(40)));
-            inputRows.add(row);
-        }
-        View p = pills[pillIdx];
-        float[] o = offset(p, root);
-        FrameLayout.LayoutParams l = new FrameLayout.LayoutParams(px(pillIdx == P_AUDIO ? 220 : 200), -2);
-        l.gravity = Gravity.TOP | Gravity.LEFT;
-        l.leftMargin = Math.round(o[0]);
-        l.topMargin = Math.round(o[1] + p.getHeight() + px(10));
-        overlay.addView(panel, l);
-        dropdown = panel;
-        panel.setPivotX(px(30)); panel.setPivotY(0);
-        panel.setAlpha(0f); panel.setScaleX(0.96f); panel.setScaleY(0.96f);
-        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).setInterpolator(new DecelerateInterpolator()).start();
-        dropdownOpen = true;
-        inputIdx = 0;
-        for (int i = 0; i < inputs.size(); i++) if (inputs.get(i).current) inputIdx = i;
-        paintInputs();
-    }
-
-    void paintInputs() {
-        for (int i = 0; i < inputRows.size(); i++) {
-            TextView r = inputRows.get(i);
-            boolean f = i == inputIdx;
-            if (f) {
-                GradientDrawable s = new GradientDrawable();
-                s.setCornerRadius(px(14));
-                s.setColor(0x33FFFFFF);
-                s.setStroke(Math.max(1, px(0.75f)), 0x40FFFFFF);
-                r.setBackground(s);
-            } else r.setBackground(null);
-            r.setTextColor(f ? 0xFFFFFFFF : 0xB3FFFFFF);
-        }
-    }
-
-    void dropdownKey(int k) {
-        if (k == KeyEvent.KEYCODE_DPAD_UP) { if (inputIdx > 0) inputIdx--; }
-        else if (k == KeyEvent.KEYCODE_DPAD_DOWN) { if (inputIdx < inputRows.size() - 1) inputIdx++; }
-        else { closeDropdown(); return; }
-        paintInputs();
-    }
-
-    void closeDropdown() {
-        if (!dropdownOpen) return;
-        dropdownOpen = false;
-        final View d = dropdown;
-        dropdown = null;
-        d.animate().alpha(0f).setDuration(120).withEndAction(new Runnable() { public void run() { overlay.removeView(d); } }).start();
-    }
-
-    void pickInput() {
-        InputItem it = inputs.get(inputIdx);
-        closeDropdown();
-        if (it.audio >= 0) { setAudioOutput(it.audio); return; }
-        if (it.liveTv) {
-            Intent i = pm.getLeanbackLaunchIntentForPackage("com.realtek.tv");
-            if (i == null) i = new Intent(Intent.ACTION_VIEW, TvContract.Channels.CONTENT_URI);
-            start(i);
-        } else {
-            Intent i = new Intent(Intent.ACTION_VIEW, TvContract.buildChannelUriForPassthroughInput(it.id));
-            try { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); }
-            catch (Exception e) { i.setPackage("com.realtek.tv"); start(i); }
-        }
-    }
-
-    // ------------------------------------------------------------------ status
-
-    void updateGreeting() {
-        Calendar c = Calendar.getInstance();
-        int h = c.get(Calendar.HOUR_OF_DAY);
-        greeting.setText(h < 5 ? "Good night" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : h < 22 ? "Good evening" : "Good night");
-        // one wake-up at the next hour boundary, no polling
-        handler.removeCallbacks(greetTick);
-        long ms = (60 - c.get(Calendar.MINUTE)) * 60000L - c.get(Calendar.SECOND) * 1000L + 500;
-        handler.postDelayed(greetTick, ms);
-    }
-    final Runnable greetTick = new Runnable() { public void run() { updateGreeting(); } };
-
-    @SuppressWarnings("deprecation")
-    void updateWifi() {
-        String label = "Offline";
-        try {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            NetworkInfo ni = cm.getActiveNetworkInfo();
-            if (ni != null && ni.isConnected()) {
-                if (ni.getType() == ConnectivityManager.TYPE_ETHERNET) label = "Ethernet";
-                else {
-                    label = "Wi-Fi";
-                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
-                    WifiInfo wi = wm.getConnectionInfo();
-                    String ssid = wi == null ? null : wi.getSSID();
-                    if (ssid != null && !ssid.contains("unknown ssid")) label = ssid.replace("\"", "");
-                }
-            }
-        } catch (Exception e) { }
-        if (wifiText != null) wifiText.setText(label);
-        if (zone == TOP && content.getWidth() > 0)
-            root.post(new Runnable() { public void run() { focusCurrent(false); } });
-    }
-
-    final BroadcastReceiver netReceiver = new BroadcastReceiver() {
-        public void onReceive(Context c, Intent i) { updateWifi(); }
-    };
     final BroadcastReceiver pkgReceiver = new BroadcastReceiver() {
-        public void onReceive(Context c, Intent i) { colorCache.clear(); loadApps(); }
+        public void onReceive(Context c, Intent i) { loadApps(); }
     };
 
     void registerReceivers() {
@@ -970,486 +1212,20 @@ public class HomeActivity extends Activity {
         pf.addAction(Intent.ACTION_PACKAGE_CHANGED);
         pf.addDataScheme("package");
         reg(pkgReceiver, pf);
-        IntentFilter nf = new IntentFilter();
-        nf.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
-        nf.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
-        reg(netReceiver, nf);
-        IntentFilter bf = new IntentFilter();
-        bf.addAction(Intent.ACTION_DATE_CHANGED);
-        bf.addAction(Intent.ACTION_TIMEZONE_CHANGED);
-        reg(sysReceiver, bf);
-        getContentResolver().registerContentObserver(Settings.Global.getUriFor("speaker_index"), false, audioObserver);
-        IntentFilter sf = new IntentFilter();
-        sf.addAction(Intent.ACTION_SCREEN_ON);
-        sf.addAction(Intent.ACTION_SCREEN_OFF);
-        reg(screenReceiver, sf);
-        if (((android.os.PowerManager) getSystemService(POWER_SERVICE)).isInteractive()) screenOn();
     }
 
     void reg(BroadcastReceiver r, IntentFilter f) {
-        try {   // registerReceiver(r, f, RECEIVER_EXPORTED) – needed when targeting API 34
+        try {
             Context.class.getMethod("registerReceiver", BroadcastReceiver.class, IntentFilter.class, int.class)
                     .invoke(this, r, f, 0x2);
         } catch (Exception e) { registerReceiver(r, f); }
     }
 
-    // ------------------------------------------------------------------ top bar (pinned, not scrolled)
-
-    void buildTopBar() {
-        topScrim = new View(this);
-        topScrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xFA05080F, 0xF205080F, 0xB305080F, 0x0005080F}));
-        topScrim.setAlpha(0f);
-        root.addView(topScrim, new FrameLayout.LayoutParams(-1, px(124)));
-        topBar = new FrameLayout(this);
-        root.addView(topBar, new FrameLayout.LayoutParams(-1, px(64)));
-
-        pillRow = new LinearLayout(this);
-        pillRow.setOrientation(LinearLayout.HORIZONTAL);
-        pills[P_INPUTS] = pill(P_INPUTS, new Icon(Icon.INPUT), "Inputs");
-        pills[P_WIFI] = pill(P_WIFI, new Icon(Icon.WIFI), "Wi-Fi");
-        pills[P_AUDIO] = pill(P_AUDIO, new Icon(Icon.AUDIO), "TV speaker");
-        pills[P_SETTINGS] = pill(P_SETTINGS, new Icon(Icon.GEAR), null);
-        wifiText = pillText[P_WIFI];
-        audioText = pillText[P_AUDIO];
-        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(-2, px(40));
-        pl.gravity = Gravity.TOP | Gravity.LEFT;
-        pl.topMargin = px(12); pl.leftMargin = px(SIDE);
-        topBar.addView(pillRow, pl);
-
-        // RAM gauge, far right, display only
-        LinearLayout ram = new LinearLayout(this);
-        ram.setOrientation(LinearLayout.HORIZONTAL);
-        ram.setGravity(Gravity.CENTER_VERTICAL);
-        TextView lab = cap("RAM");
-        ram.addView(lab);
-        ramBar = new Widgets.Bar(this, dp);
-        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(px(96), px(6));
-        bl.leftMargin = px(10); bl.rightMargin = px(10);
-        ram.addView(ramBar, bl);
-        ramText = text(13, fReg, 0xB3FFFFFF);
-        ram.addView(ramText);
-        FrameLayout.LayoutParams rl = new FrameLayout.LayoutParams(-2, px(40));
-        rl.gravity = Gravity.TOP | Gravity.RIGHT;
-        rl.topMargin = px(12); rl.rightMargin = px(SIDE);
-        topBar.addView(ram, rl);
-    }
-
-    TextView cap(String s) {
-        TextView t = text(10.5f, fMed, 0x80FFFFFF);
-        t.setText(s.toUpperCase(Locale.US));
-        t.setLetterSpacing(0.1f);
-        t.setSingleLine(true);
-        return t;
-    }
-
-    LinearLayout card(float x, float y, float w, float h) {
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(px(18));
-        bg.setColor(0x12FFFFFF);
-        bg.setStroke(Math.max(1, px(0.75f)), 0x1AFFFFFF);
-        c.setBackground(bg);
-        c.setPadding(px(14), px(11), px(14), px(10));
-        content.addView(c, lp(w, h, x, y));
-        return c;
-    }
-
-    LinearLayout row() {
-        LinearLayout r = new LinearLayout(this);
-        r.setOrientation(LinearLayout.HORIZONTAL);
-        r.setGravity(Gravity.CENTER_VERTICAL);
-        return r;
-    }
-
-    // ------------------------------------------------------------------ widgets (right side)
-
-    void buildWidgets() {
-        // weather
-        LinearLayout w = card(WX, WY, WCOL, 80);
-        FrameLayout wh = new FrameLayout(this);
-        wPlace = cap(place);
-        wh.addView(wPlace);
-        wHiLo = cap("");
-        FrameLayout.LayoutParams hl2 = new FrameLayout.LayoutParams(-2, -2);
-        hl2.gravity = Gravity.RIGHT;
-        wh.addView(wHiLo, hl2);
-        w.addView(wh, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout wr = row();
-        wIcon = new Widgets.WeatherIcon(dp);
-        wIconView = new ImageView(this);
-        wIconView.setImageDrawable(wIcon);
-        wIconView.setAlpha(0.9f);
-        wr.addView(wIconView, new LinearLayout.LayoutParams(px(26), px(26)));
-        wTemp = text(28, fLight, 0xF2FFFFFF);
-        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
-        tl.leftMargin = px(8); tl.rightMargin = px(10);
-        wr.addView(wTemp, tl);
-        LinearLayout wc = new LinearLayout(this);
-        wc.setOrientation(LinearLayout.VERTICAL);
-        wCond = text(13, fReg, 0xD9FFFFFF); wCond.setSingleLine(true);
-        wSub = text(11, fReg, 0x8CFFFFFF); wSub.setSingleLine(true);
-        wc.addView(wCond); wc.addView(wSub);
-        wr.addView(wc);
-        LinearLayout.LayoutParams wrl = new LinearLayout.LayoutParams(-1, -2);
-        wrl.topMargin = px(6);
-        w.addView(wr, wrl);
-
-        // nifty
-        LinearLayout n = card(WX, WY + 88, WCOL, 84);
-        FrameLayout nh = new FrameLayout(this);
-        nh.addView(cap("Nifty 50"));
-        nStatus = cap("");
-        FrameLayout.LayoutParams sl = new FrameLayout.LayoutParams(-2, -2);
-        sl.gravity = Gravity.RIGHT;
-        nh.addView(nStatus, sl);
-        n.addView(nh, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout nr = row();
-        nVal = text(22, fLight, 0xF2FFFFFF);
-        nr.addView(nVal);
-        nChg = text(13, fMed, 0xB3FFFFFF);
-        LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(-2, -2);
-        cl.leftMargin = px(10);
-        nr.addView(nChg, cl);
-        LinearLayout.LayoutParams nrl = new LinearLayout.LayoutParams(-1, -2);
-        nrl.topMargin = px(5);
-        n.addView(nr, nrl);
-        spark = new Widgets.Sparkline(this, dp);
-        LinearLayout.LayoutParams spl = new LinearLayout.LayoutParams(-1, px(18));
-        spl.topMargin = px(5);
-        n.addView(spark, spl);
-
-        // screen time
-        LinearLayout st = card(WX, WY + 180, WCOL, WBOTTOM - WY - 180);
-        st.addView(cap("Screen time · daily avg"));
-        LinearLayout sr = row();
-        stVal = text(22, fLight, 0xF2FFFFFF);
-        sr.addView(stVal);
-        stSub = text(11.5f, fReg, 0x8CFFFFFF);
-        LinearLayout.LayoutParams ssl = new LinearLayout.LayoutParams(-2, -2);
-        ssl.leftMargin = px(10);
-        sr.addView(stSub, ssl);
-        LinearLayout.LayoutParams srl = new LinearLayout.LayoutParams(-1, -2);
-        srl.topMargin = px(5);
-        st.addView(sr, srl);
-
-        // calendar
-        LinearLayout cal = card(CALX, WY, CALW, WBOTTOM - WY);
-        month = new Widgets.MonthView(this, dp, fReg, fMed, fBold);
-        cal.addView(month, new LinearLayout.LayoutParams(-1, -1));
-
-        wTemp.setText("—"); wCond.setText("Loading…"); wSub.setText("");
-        nVal.setText("—"); nChg.setText(""); nStatus.setText("");
-        stVal.setText("—"); stSub.setText("");
-    }
-
-    void showCachedWidgets() {
-        long now = System.currentTimeMillis();
-        SharedPreferences.Editor ed = prefs.edit().remove("n_json");          // old full-JSON cache (v1.2)
-        if (now - prefs.getLong("w_at", 0) > DAY || !hasLocation() || !locKey().equals(prefs.getString("w_loc", "")))
-            ed.remove("w_json").remove("w_at").remove("w_loc");             // stale, no location, or the location changed
-        if (now - prefs.getLong("n_at", 0) > DAY) ed.remove("n_cache").remove("n_at");
-        ed.apply();
-        String wj = prefs.getString("w_json", null);
-        if (wj != null) showWeather(wj);
-        String nc = prefs.getString("n_cache", null);
-        if (nc != null) try { showQuote(Widgets.decodeQuote(nc)); } catch (Exception e) { }
-        if (prefs.contains("st_avg")) showScreenTime(prefs.getLong("st_avg", 0), prefs.getInt("st_days", 7));
-    }
-
-    /** Optional files/widgets.txt: lat=…, lon=…, place=… (one per line). */
-    void readWidgetConfig() {
-        File f = new File(getExternalFilesDir(null), "widgets.txt");
-        if (!f.exists()) return;
-        try {
-            BufferedReader r = new BufferedReader(new FileReader(f));
-            String line;
-            while ((line = r.readLine()) != null) {
-                int eq = line.indexOf('=');
-                if (eq < 0 || line.trim().startsWith("#")) continue;
-                String k = line.substring(0, eq).trim(), v = line.substring(eq + 1).trim();
-                if (k.equals("lat")) lat = Double.parseDouble(v);
-                else if (k.equals("lon")) lon = Double.parseDouble(v);
-                else if (k.equals("place")) place = v;
-            }
-            r.close();
-        } catch (Exception e) { }
-    }
-
-    boolean hasLocation() { return !Double.isNaN(lat) && !Double.isNaN(lon); }
-
-    /** Identifies the cached weather's location, so a new widgets.txt doesn't show the old place's weather. */
-    String locKey() { return hasLocation() ? lat + "," + lon : ""; }
-
-    // ------------------------------------------------------------------ RAM (every 5 s while visible, local only)
-
-    final Runnable ramTick = new Runnable() {
-        public void run() {
-            try {
-                ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
-                ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
-                am.getMemoryInfo(mi);
-                long used = mi.totalMem - mi.availMem;
-                ramBar.set(used / (float) mi.totalMem);
-                ramText.setText(String.format(Locale.US, "%.1f / %.1f GB", used / 1073741824.0, mi.totalMem / 1073741824.0));
-            } catch (Exception e) { }
-            if (visible) handler.postDelayed(this, 5000);
-        }
-    };
-
-    // ------------------------------------------------------------------ audio output pill
-    // The TV keeps the chosen output in Settings.Global "speaker_index" (0 TV speaker, 1 S/PDIF optical,
-    // 2 HDMI ARC). Changing it needs a system app, so we ask Realtek's own receiver
-    // (com.realtek.slices/.OutputDeviceReceiver), which toggles TV speaker <-> optical and calls the
-    // audio service. Optical is one-way: whether a speaker is attached and on cannot be detected.
-    static final String[] AUDIO_NAMES = {"TV speaker", "Optical", "HDMI ARC"};
-
-    int audioIndex() {
-        try { return Settings.Global.getInt(getContentResolver(), "speaker_index", 0); }
-        catch (Exception e) { return 0; }
-    }
-
-    void updateAudioPill() {
-        int i = audioIndex();
-        setPillText(audioText, i >= 0 && i < AUDIO_NAMES.length ? AUDIO_NAMES[i] : "Audio");
-    }
-
-    void setPillText(TextView t, String s) {
-        if (t == null || s.equals(t.getText().toString())) return;
-        t.setText(s);
-        if (zone == TOP && content.getWidth() > 0)
-            root.post(new Runnable() { public void run() { focusCurrent(false); } });
-    }
-
-    final ContentObserver audioObserver = new ContentObserver(handler) {
-        public void onChange(boolean self) { updateAudioPill(); }
-    };
-
-    void setAudioOutput(final int target) {
-        if (target == 2) { start(new Intent(Settings.ACTION_SETTINGS)); return; }   // ARC needs HDMI-CEC calls: use TV settings
-        final int[] tries = {0};
-        handler.post(new Runnable() {
-            public void run() {
-                if (audioIndex() == target) { updateAudioPill(); return; }
-                if (tries[0]++ >= 2) {
-                    android.widget.Toast.makeText(HomeActivity.this, "Couldn't switch audio output", android.widget.Toast.LENGTH_SHORT).show();
-                    updateAudioPill();
-                    return;
-                }
-                try {
-                    Intent b = new Intent("com.realtek.device_output_key");
-                    b.setClassName("com.realtek.slices", "com.realtek.slices.OutputDeviceReceiver");
-                    sendBroadcast(b);
-                } catch (Exception e) { android.util.Log.w("GlassHome", "audio toggle failed: " + e); }
-                handler.postDelayed(this, 900);
-            }
-        });
-    }
-
-    final BroadcastReceiver sysReceiver = new BroadcastReceiver() {
-        public void onReceive(Context c, Intent i) { month.invalidate(); }
-    };
-
-    // ------------------------------------------------------------------ weather: hourly
-
-    static final long HOUR = 3600000L;
-    final Runnable weatherTick = new Runnable() { public void run() { maybeFetchWeather(); } };
-
-    void maybeFetchWeather() {
-        handler.removeCallbacks(weatherTick);
-        if (!hasLocation()) { wCond.setText("No location"); wSub.setText("Set it in widgets.txt"); return; }
-        long age = System.currentTimeMillis() - prefs.getLong("w_at", 0);
-        if (age >= HOUR) fetchWeather();
-        else if (visible) handler.postDelayed(weatherTick, HOUR - age);
-    }
-
-    void fetchWeather() {
-        net.post(new Runnable() {
-            public void run() {
-                try {
-                    final String js = Widgets.get(Widgets.weatherUrl(lat, lon));
-                    Widgets.parseWeather(js);   // validate before caching
-                    handler.post(new Runnable() {
-                        public void run() {
-                            prefs.edit().putString("w_json", js).putLong("w_at", System.currentTimeMillis())
-                                    .putString("w_loc", locKey()).apply();
-                            showWeather(js);
-                            if (visible) handler.postDelayed(weatherTick, HOUR);
-                        }
-                    });
-                } catch (final Exception e) {
-                    handler.post(new Runnable() {
-                        public void run() {
-                            if (!prefs.contains("w_json")) { wCond.setText("Unavailable"); wSub.setText("Retrying in 10 min"); }
-                            if (visible) handler.postDelayed(weatherTick, 10 * 60000L);
-                        }
-                    });
-                }
-            }
-        });
-    }
-
-    void showWeather(String js) {
-        try {
-            Widgets.Weather w = Widgets.parseWeather(js);
-            wTemp.setText(Math.round(w.temp) + "°");
-            wCond.setText(Widgets.weatherText(w.code));
-            wSub.setText("Feels " + Math.round(w.feels) + "°");
-            wHiLo.setText("H " + Math.round(w.hi) + "°  L " + Math.round(w.lo) + "°");
-            wIcon.code = w.code; wIcon.day = w.day;
-            wIconView.invalidate();
-        } catch (Exception e) { }
-    }
-
-    // ------------------------------------------------------------------ Nifty: every minute in market hours
-
-    final Runnable niftyTick = new Runnable() {
-        public void run() {
-            boolean open = Widgets.marketOpen();
-            long age = System.currentTimeMillis() - prefs.getLong("n_at", 0);
-            // outside market hours fetch at most every 6 h, just to pick up the close
-            if (open || age > 6 * HOUR || !prefs.contains("n_cache")) fetchNifty();
-            else showNiftyStatus();
-            if (visible) handler.postDelayed(this, open ? 60000L : 5 * 60000L);
-        }
-    };
-
-    void fetchNifty() {
-        net.post(new Runnable() {
-            public void run() {
-                try {
-                    final Widgets.Quote q = Widgets.parseQuote(Widgets.get(Widgets.NIFTY_URL));
-                    handler.post(new Runnable() {
-                        public void run() {
-                            prefs.edit().putString("n_cache", Widgets.encodeQuote(q)).putLong("n_at", System.currentTimeMillis()).apply();
-                            showQuote(q);
-                        }
-                    });
-                } catch (Exception e) {
-                    handler.post(new Runnable() {
-                        public void run() { if (!prefs.contains("n_cache")) { nVal.setText("—"); nStatus.setText("UNAVAILABLE"); } }
-                    });
-                }
-            }
-        });
-    }
-
-    long niftyTime;
-    void showQuote(Widgets.Quote q) {
-        try {
-            nVal.setText(String.format(Locale.US, "%,.2f", q.price));
-            double ch = q.price - q.prevClose, pct = q.prevClose == 0 ? 0 : ch * 100 / q.prevClose;
-            nChg.setText(String.format(Locale.US, "%s %.2f%%", ch >= 0 ? "▲" : "▼", Math.abs(pct)));
-            nChg.setTextColor(ch >= 0 ? 0xFF34D399 : 0xFFF87171);
-            spark.set(q.series, (float) q.prevClose);
-            niftyTime = q.marketTime;
-            showNiftyStatus();
-        } catch (Exception e) { }
-    }
-
-    void showNiftyStatus() {
-        String t = niftyTime > 0 ? new java.text.SimpleDateFormat("H:mm", Locale.US).format(new java.util.Date(niftyTime)) : "";
-        nStatus.setText((Widgets.marketOpen() ? "LIVE " : "CLOSED ") + t);
-    }
-
-    // ------------------------------------------------------------------ screen time: once a day, 7-day daily average
-
-    static final long DAY = 86400000L;
-
-    String dayKey() {
-        Calendar c = Calendar.getInstance();
-        return c.get(Calendar.YEAR) + "-" + c.get(Calendar.DAY_OF_YEAR);
-    }
-
-    void maybeComputeScreenTime() {
-        int h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
-        boolean have = prefs.contains("st_avg");
-        if (!dayKey().equals(prefs.getString("st_day", "")) && (h >= 6 || !have)) computeScreenTime();
-        else if (!have) { stVal.setText("—"); stSub.setText("tracking since today"); }
-    }
-
-    // Android's usage history on this TV is unusable (its buckets are dated 2027 after a clock glitch),
-    // so Glass Home keeps its own log: screen-on spans from SCREEN_ON/OFF broadcasts, summed per day.
-    static String dayKey(long t) {
-        Calendar c = Calendar.getInstance();
-        c.setTimeInMillis(t);
-        return c.get(Calendar.YEAR) + "-" + c.get(Calendar.DAY_OF_YEAR);
-    }
-
-    static long midnight(long t) {
-        Calendar c = Calendar.getInstance();
-        c.setTimeInMillis(t);
-        c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0); c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0);
-        return c.getTimeInMillis();
-    }
-
-    /** Credit [from, to) to per-day totals, splitting at midnights. */
-    void addScreenSpan(long from, long to) {
-        if (from <= 0 || to <= from || to - from > 2 * DAY) return;   // ignore nonsense (clock jumps)
-        SharedPreferences.Editor ed = prefs.edit();
-        long t = from;
-        while (t < to) {
-            long next = Math.min(to, midnight(t) + DAY);
-            String k = "std_" + dayKey(t);
-            ed.putLong(k, prefs.getLong(k, 0) + (next - t));
-            t = next;
-        }
-        ed.apply();
-    }
-
-    void screenOn() {
-        long now = System.currentTimeMillis();
-        if (prefs.getLong("st_on", 0) == 0) prefs.edit().putLong("st_on", now).apply();
-        if (!prefs.contains("st_start")) prefs.edit().putLong("st_start", now).apply();
-    }
-
-    void screenOff() {
-        long now = System.currentTimeMillis(), on = prefs.getLong("st_on", 0);
-        addScreenSpan(on, now);
-        prefs.edit().putLong("st_on", 0).apply();
-    }
-
-    final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
-        public void onReceive(Context c, Intent i) {
-            if (Intent.ACTION_SCREEN_ON.equals(i.getAction())) screenOn(); else screenOff();
-        }
-    };
-
-    void computeScreenTime() {
-        long now = System.currentTimeMillis(), today = midnight(now);
-        // close any span still open from before midnight so yesterday is complete
-        long on = prefs.getLong("st_on", 0);
-        if (on > 0 && on < today) { addScreenSpan(on, today); prefs.edit().putLong("st_on", today).apply(); }
-        long start = prefs.getLong("st_start", now);
-        int days = (int) Math.min(7, (today - midnight(start)) / DAY);   // complete days tracked
-        if (days <= 0) { stVal.setText("—"); stSub.setText("tracking since today"); return; }
-        long total = 0;
-        for (int d = 1; d <= days; d++) total += prefs.getLong("std_" + dayKey(today - d * DAY + 3600000L), 0);
-        long avg = total / days;
-        // keep today + the last 7 days only
-        SharedPreferences.Editor ed = prefs.edit();
-        for (String k : new ArrayList<String>(prefs.getAll().keySet()))
-            if (k.startsWith("std_")) {
-                boolean keep = false;
-                for (int d = 0; d <= 7; d++) if (k.equals("std_" + dayKey(today - d * DAY + 3600000L))) keep = true;
-                if (!keep) ed.remove(k);
-            }
-        ed.putLong("st_avg", avg).putInt("st_days", days).putString("st_day", dayKey()).apply();
-        showScreenTime(avg, days);
-    }
-
-    void showScreenTime(long avg, int days) {
-        long m = avg / 60000L;
-        stVal.setText(m >= 60 ? (m / 60) + "h " + String.format(Locale.US, "%02d", m % 60) + "m" : m + "m");
-        stSub.setText(days >= 7 ? "last 7 days" : "last " + days + (days == 1 ? " day" : " days"));
-    }
-
-
-    // ------------------------------------------------------------------ helpers
+    // ------------------------------------------------------------------ helpers & drawables
 
     static float lerp(float a, float b, float t) { return a + (b - a) * t; }
     static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    static float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
 
     static float[] offset(View v, View ancestor) {
         float x = 0, y = 0;
@@ -1474,65 +1250,39 @@ public class HomeActivity extends Activity {
         } catch (Throwable t) { return null; }
     }
 
-    /** Lays out its single child at full width and natural (unbounded) height; scrolling = translationY. */
-    static class Pane extends ViewGroup {
-        Pane(Context c) { super(c); setClipChildren(false); }
-        @Override protected void onMeasure(int w, int h) {
-            setMeasuredDimension(MeasureSpec.getSize(w), MeasureSpec.getSize(h));
-            for (int i = 0; i < getChildCount(); i++) {
-                View c = getChildAt(i);
-                ViewGroup.LayoutParams lp = c.getLayoutParams();
-                int hs = lp != null && lp.height > 0 ? MeasureSpec.makeMeasureSpec(lp.height, MeasureSpec.EXACTLY)
-                        : MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(h), MeasureSpec.EXACTLY);
-                c.measure(MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(w), MeasureSpec.EXACTLY), hs);
-            }
-        }
-        @Override protected void onLayout(boolean ch, int l, int t, int r, int b) {
-            for (int i = 0; i < getChildCount(); i++) {
-                View c = getChildAt(i);
-                c.layout(0, 0, c.getMeasuredWidth(), c.getMeasuredHeight());
-            }
-        }
-    }
-
-    /** Damped spring: overshoots ~8% then settles. */
     static class Spring implements TimeInterpolator {
         public float getInterpolation(float t) { return (float) (1 - Math.exp(-7 * t) * Math.cos(9 * t)); }
     }
 
-    /** The translucent glass highlight: faint fill, top sheen, bright hairline edge. No blur. */
+    /** Clean selection outline: white border in normal mode, electric cyan in Move Mode. */
     class Glass extends Drawable {
-        float radius = px(13);
-        final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), sheen = new Paint(Paint.ANTI_ALIAS_FLAG),
-                edge = new Paint(Paint.ANTI_ALIAS_FLAG), halo = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float radius = px(10);
+        final Paint edge = new Paint(Paint.ANTI_ALIAS_FLAG);
         final RectF r = new RectF();
         Glass() {
-            fill.setColor(0x1AFFFFFF);
             edge.setStyle(Paint.Style.STROKE);
-            edge.setStrokeWidth(px(1.5f));
-            halo.setStyle(Paint.Style.STROKE);
-            halo.setStrokeWidth(px(5f));
-            halo.setColor(0x14FFFFFF);
+            edge.setStrokeWidth(px(2.0f));
         }
         @Override public void draw(Canvas c) {
             r.set(getBounds());
-            RectF hr = new RectF(r); hr.inset(-px(2.5f), -px(2.5f));
-            c.drawRoundRect(hr, radius + px(2.5f), radius + px(2.5f), halo);
-            r.inset(px(0.75f), px(0.75f));
-            c.drawRoundRect(r, radius, radius, fill);
-            sheen.setShader(new LinearGradient(0, r.top, 0, r.top + r.height() * 0.55f, 0x2EFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP));
-            c.drawRoundRect(r, radius, radius, sheen);
-            edge.setShader(new LinearGradient(0, r.top, 0, r.bottom, 0xB3FFFFFF, 0x40FFFFFF, Shader.TileMode.CLAMP));
+            r.inset(px(1f), px(1f));
+            if (reorderMode) {
+                edge.setColor(0xFF38BDF8);
+                edge.setStrokeWidth(px(2.5f));
+            } else {
+                edge.setColor(0xFFFFFFFF);
+                edge.setStrokeWidth(px(2.0f));
+            }
             c.drawRoundRect(r, radius, radius, edge);
         }
-        @Override public void setAlpha(int a) { }
-        @Override public void setColorFilter(ColorFilter cf) { }
+        @Override public void setAlpha(int a) { edge.setAlpha(a); }
+        @Override public void setColorFilter(ColorFilter cf) { edge.setColorFilter(cf); }
         @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
     }
 
-    /** Small line icons for the pills. */
+    /** Small vector icons for Gemini and Sleep. */
     class Icon extends Drawable {
-        static final int INPUT = 0, WIFI = 1, GEAR = 2, AUDIO = 3;
+        static final int GEMINI = 0, SLEEP = 1;
         final int kind;
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         Icon(int k) {
@@ -1547,42 +1297,269 @@ public class HomeActivity extends Activity {
             float w = getBounds().width(), h = getBounds().height(), u = w / 18f;
             c.save();
             c.translate(getBounds().left, getBounds().top);
-            if (kind == INPUT) {
-                c.drawRoundRect(new RectF(4 * u, 3 * u, 16.5f * u, 13 * u), 2 * u, 2 * u, p);
-                c.drawLine(7 * u, 16 * u, 13.5f * u, 16 * u, p);
-                c.drawLine(1.5f * u, 8 * u, 9.5f * u, 8 * u, p);
-                Path a = new Path();
-                a.moveTo(7 * u, 5.5f * u); a.lineTo(9.5f * u, 8 * u); a.lineTo(7 * u, 10.5f * u);
-                c.drawPath(a, p);
-            } else if (kind == WIFI) {
-                float cx = 9 * u, cy = 15 * u;
-                for (int i = 1; i <= 3; i++) {
-                    float rr = i * 4f * u;
-                    c.drawArc(new RectF(cx - rr, cy - rr, cx + rr, cy + rr), 225, 90, false, p);
-                }
-                Paint dot = new Paint(p); dot.setStyle(Paint.Style.FILL);
-                c.drawCircle(cx, cy, 1.2f * u, dot);
-            } else if (kind == AUDIO) {
-                Path b = new Path();
-                b.moveTo(2.5f * u, 7 * u); b.lineTo(5.5f * u, 7 * u); b.lineTo(9.5f * u, 3.5f * u);
-                b.lineTo(9.5f * u, 14.5f * u); b.lineTo(5.5f * u, 11 * u); b.lineTo(2.5f * u, 11 * u); b.close();
-                c.drawPath(b, p);
-                c.drawArc(new RectF(8.5f * u, 6 * u, 14.5f * u, 12 * u), -50, 100, false, p);
-                c.drawArc(new RectF(8 * u, 3 * u, 17.5f * u, 15 * u), -50, 100, false, p);
-            } else {
-                float cx = 9 * u, cy = 9 * u;
-                c.drawCircle(cx, cy, 5f * u, p);
-                c.drawCircle(cx, cy, 2.2f * u, p);
-                for (int i = 0; i < 8; i++) {
-                    double a = Math.PI * i / 4;
-                    c.drawLine(cx + (float) Math.cos(a) * 5.2f * u, cy + (float) Math.sin(a) * 5.2f * u,
-                            cx + (float) Math.cos(a) * 7.6f * u, cy + (float) Math.sin(a) * 7.6f * u, p);
-                }
+            if (kind == GEMINI) {
+                // Official Google Gemini 4-point sparkle star
+                float cx = 9 * u, cy = 9 * u, R = 7.5f * u;
+                Path sp = new Path();
+                sp.moveTo(cx, cy - R);
+                sp.quadTo(cx, cy, cx + R, cy);
+                sp.quadTo(cx, cy, cx, cy + R);
+                sp.quadTo(cx, cy, cx - R, cy);
+                sp.quadTo(cx, cy, cx, cy - R);
+                sp.close();
+                Paint pGem = new Paint(p);
+                pGem.setStyle(Paint.Style.FILL_AND_STROKE);
+                pGem.setColor(0xFF38BDF8);
+                c.drawPath(sp, pGem);
+                Paint dot = new Paint(p);
+                dot.setStyle(Paint.Style.FILL);
+                dot.setColor(Color.WHITE);
+                c.drawCircle(cx, cy, 1.3f * u, dot);
+            } else if (kind == SLEEP) {
+                // Universal power / sleep standby icon
+                float cx = 9 * u, cy = 9.5f * u, r = 5.2f * u;
+                c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), -60, 300, false, p);
+                c.drawLine(cx, cy - r - 1.8f * u, cx, cy, p);
             }
             c.restore();
         }
         @Override public void setAlpha(int a) { p.setAlpha(a); }
         @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
         @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+    }
+
+    // ==================================================================
+    // WebDAV Photo Streaming, Uncropped Display & Dynamic Ambient Glow
+    // ==================================================================
+
+    void loadDefaultAssetWallpaper() {
+        try {
+            InputStream is = getAssets().open("default_wallpaper.jpg");
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inPreferredConfig = Bitmap.Config.RGB_565;
+            Bitmap bm = BitmapFactory.decodeStream(is, null, o);
+            is.close();
+            if (bm != null) {
+                photoA.setImageBitmap(bm);
+                photoA.setAlpha(1f);
+                if (wallpaperGlowEnabled) {
+                    glowA.setImageDrawable(createGlowDrawable(GLOW_COLORS[rng.nextInt(GLOW_COLORS.length)]));
+                    glowA.setAlpha(0.45f);
+                }
+            }
+        } catch (Throwable t) {
+            android.util.Log.e("GlassHome", "Could not load default asset wallpaper", t);
+        }
+    }
+
+    void startPhotoRotation() {
+        handler.removeCallbacks(photoRotateRunnable);
+        if (webdavUrl != null && !webdavUrl.trim().isEmpty() && webdavFolder != null && !webdavFolder.trim().isEmpty()) {
+            final PhotoDatabase pdb = PhotoDatabase.getInstance();
+            if (pdb.getPhotoCount() == 0 && !isCrawling) {
+                crawlWebdavPhotos();
+            } else if (webdavRefreshInterval > 0) {
+                rotateToNextPhoto();
+                handler.postDelayed(photoRotateRunnable, webdavRefreshInterval * 1000L);
+            }
+        }
+    }
+
+    void stopPhotoRotation() {
+        handler.removeCallbacks(photoRotateRunnable);
+    }
+
+    void crawlWebdavPhotos() {
+        if (isCrawling) return;
+        isCrawling = true;
+        WebdavCrawler.crawlAsync(this, webdavUrl, webdavFolder, webdavUser, webdavPass, webdavRecursive, new WebdavCrawler.CrawlCallback() {
+            @Override
+            public void onCrawlComplete(final List<String> photos) {
+                isCrawling = false;
+                if (photos != null && !photos.isEmpty()) {
+                    PhotoDatabase.getInstance().syncPhotos(photos);
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            rotateToNextPhoto();
+                            if (webdavRefreshInterval > 0) {
+                                handler.removeCallbacks(photoRotateRunnable);
+                                handler.postDelayed(photoRotateRunnable, webdavRefreshInterval * 1000L);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    void rotateToNextPhoto() {
+        if (!visible) return;
+        // If media is currently active, halt rotation & downloading
+        if (PhotoDatabase.isMediaActive(this)) {
+            return;
+        }
+
+        final PhotoDatabase pdb = PhotoDatabase.getInstance();
+        if (pdb.getPhotoCount() == 0) {
+            if (!isCrawling) crawlWebdavPhotos();
+            return;
+        }
+
+        // Check if cycle completed; trigger background crawl and reset cycle
+        if (pdb.isCycleComplete() && !isCrawling) {
+            android.util.Log.i("GlassHome", "Photo cycle complete. Triggering background re-index.");
+            pdb.resetCycle();
+            crawlWebdavPhotos();
+        }
+
+        final String nextUrl = pdb.getNextPhotoUrl();
+        if (nextUrl == null) return;
+
+        photoExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (PhotoDatabase.isMediaActive(HomeActivity.this)) {
+                        return;
+                    }
+
+                    String authHeader = null;
+                    if (webdavUser != null && !webdavUser.isEmpty()) {
+                        String userPass = webdavUser + ":" + (webdavPass != null ? webdavPass : "");
+                        authHeader = "Basic " + android.util.Base64.encodeToString(userPass.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                    }
+
+                    HttpURLConnection conn = (HttpURLConnection) new URL(nextUrl).openConnection();
+                    conn.setRequestMethod("GET");
+                    if (authHeader != null) conn.setRequestProperty("Authorization", authHeader);
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(12000);
+
+                    if (conn.getResponseCode() == 200) {
+                        InputStream in = conn.getInputStream();
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        byte[] buf = new byte[8192];
+                        int r;
+                        while ((r = in.read(buf)) != -1) baos.write(buf, 0, r);
+                        in.close();
+                        byte[] imgBytes = baos.toByteArray();
+
+                        BitmapFactory.Options o = new BitmapFactory.Options();
+                        o.inJustDecodeBounds = true;
+                        BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.length, o);
+
+                        int sample = 1;
+                        while (o.outWidth / (sample * 2) >= 1920 && o.outHeight / (sample * 2) >= 1080) {
+                            sample *= 2;
+                        }
+
+                        o = new BitmapFactory.Options();
+                        o.inSampleSize = sample;
+                        o.inPreferredConfig = Bitmap.Config.RGB_565;
+                        Bitmap decodedBmp = BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.length, o);
+
+                        if (decodedBmp != null) {
+                            try {
+                                android.media.ExifInterface exif = new android.media.ExifInterface(new java.io.ByteArrayInputStream(imgBytes));
+                                int orientation = exif.getAttributeInt(
+                                        android.media.ExifInterface.TAG_ORIENTATION,
+                                        android.media.ExifInterface.ORIENTATION_NORMAL);
+                                int rotationDegrees = 0;
+                                switch (orientation) {
+                                    case android.media.ExifInterface.ORIENTATION_ROTATE_90:
+                                        rotationDegrees = 90;
+                                        break;
+                                    case android.media.ExifInterface.ORIENTATION_ROTATE_180:
+                                        rotationDegrees = 180;
+                                        break;
+                                    case android.media.ExifInterface.ORIENTATION_ROTATE_270:
+                                        rotationDegrees = 270;
+                                        break;
+                                }
+                                if (rotationDegrees != 0) {
+                                    android.graphics.Matrix matrix = new android.graphics.Matrix();
+                                    matrix.postRotate(rotationDegrees);
+                                    Bitmap rotatedBmp = Bitmap.createBitmap(
+                                            decodedBmp, 0, 0, decodedBmp.getWidth(), decodedBmp.getHeight(), matrix, true);
+                                    if (rotatedBmp != decodedBmp) {
+                                        decodedBmp.recycle();
+                                        decodedBmp = rotatedBmp;
+                                    }
+                                }
+                            } catch (Throwable ex) {
+                                android.util.Log.w("GlassHome", "Could not parse EXIF orientation", ex);
+                            }
+                        }
+
+                        final Bitmap bmp = decodedBmp;
+                        final int glowColor = GLOW_COLORS[rng.nextInt(GLOW_COLORS.length)];
+
+                        if (bmp != null) {
+                            handler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    crossfadePhoto(bmp, glowColor);
+                                }
+                            });
+                        }
+                    }
+                    conn.disconnect();
+                } catch (Throwable t) {
+                    android.util.Log.e("GlassHome", "Failed loading photo: " + nextUrl, t);
+                }
+            }
+        });
+    }
+
+    void crossfadePhoto(final Bitmap bmp, final int glowColor) {
+        if (!visible) return;
+
+        final ImageView inPhoto = isBufferAActive ? photoB : photoA;
+        final ImageView outPhoto = isBufferAActive ? photoA : photoB;
+        final ImageView inGlow = isBufferAActive ? glowB : glowA;
+        final ImageView outGlow = isBufferAActive ? glowA : glowB;
+
+        inPhoto.setImageBitmap(bmp);
+        inPhoto.setAlpha(0f);
+
+        if (wallpaperGlowEnabled) {
+            inGlow.setImageDrawable(createGlowDrawable(glowColor));
+            inGlow.setAlpha(0f);
+        }
+
+        ValueAnimator anim = ValueAnimator.ofFloat(0f, 1f);
+        anim.setDuration(1200);
+        anim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override
+            public void onAnimationUpdate(ValueAnimator va) {
+                float f = (Float) va.getAnimatedValue();
+                inPhoto.setAlpha(f);
+                outPhoto.setAlpha(1f - f);
+                if (wallpaperGlowEnabled) {
+                    inGlow.setAlpha(f * 0.45f);
+                    outGlow.setAlpha((1f - f) * 0.45f);
+                }
+            }
+        });
+        anim.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(android.animation.Animator animation) {
+                isBufferAActive = !isBufferAActive;
+            }
+        });
+        anim.start();
+    }
+
+    Drawable createGlowDrawable(int color) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        gd.setGradientRadius(px(540));
+        gd.setGradientCenter(0.5f, 0.45f);
+        int cCore = Color.argb(190, Color.red(color), Color.green(color), Color.blue(color));
+        int cMid = Color.argb(90, Color.red(color), Color.green(color), Color.blue(color));
+        int cOuter = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
+        gd.setColors(new int[]{cCore, cMid, cOuter});
+        return gd;
     }
 }

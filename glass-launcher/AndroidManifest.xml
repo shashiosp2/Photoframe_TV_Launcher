@@ -1,14 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.madhu.glasslauncher" android:versionCode="10" android:versionName="1.5">
-    <uses-sdk android:minSdkVersion="34" android:targetSdkVersion="34"/>
+    package="com.madhu.glasslauncher" android:versionCode="15" android:versionName="2.0">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="30"/>
     <uses-feature android:name="android.software.leanback" android:required="false"/>
     <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <uses-permission android:name="android.permission.INJECT_EVENTS"/>
+    <uses-permission android:name="android.permission.DEVICE_POWER"/>
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN"/>
@@ -18,10 +24,14 @@
             <action android:name="android.intent.action.MAIN"/>
             <category android:name="android.intent.category.LAUNCHER"/>
         </intent>
-        <package android:name="com.realtek.tv"/>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.INFO"/>
+        </intent>
     </queries>
     <application android:label="Glass Home" android:icon="@drawable/icon" android:banner="@drawable/banner"
-        android:theme="@style/Home" android:allowBackup="false" android:largeHeap="false">
+        android:theme="@style/Home" android:allowBackup="false" android:largeHeap="false"
+        android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true">
         <activity android:name=".HomeActivity" android:exported="true" android:launchMode="singleTask"
             android:stateNotNeeded="true" android:clearTaskOnLaunch="true" android:screenOrientation="landscape"
             android:resumeWhilePausing="true" android:excludeFromRecents="true"
@@ -30,7 +40,21 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.HOME"/>
                 <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
             </intent-filter>
         </activity>
+        <activity android:name=".SettingsActivity" android:exported="false"
+            android:theme="@style/Home" android:screenOrientation="landscape"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode|smallestScreenSize"/>
+        <service android:name=".InactivityWatchdogService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/watchdog_service_config"/>
+        </service>
     </application>
 </manifest>
