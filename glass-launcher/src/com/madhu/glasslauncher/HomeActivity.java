@@ -111,7 +111,6 @@ public class HomeActivity extends Activity {
     static final float APP_TILE_W = 78;
     static final float GAP = 12;
     static final float SCALE = 1.08f;
-    static final int FIRST_APP_INDEX = 6;
 
     static final int TYPE_GEMINI = 0, TYPE_SLEEP = 1, TYPE_APP = 2, TYPE_INPUT = 3;
 
@@ -138,6 +137,7 @@ public class HomeActivity extends Activity {
     String tzRight = "Asia/Kolkata";
     String tzRightTag = "IST";
     int watchdogTimeout = 300;
+    String showInputsConfig = "auto";
 
     // WebDAV / Photo Settings
     String webdavUrl = "";
@@ -255,12 +255,24 @@ public class HomeActivity extends Activity {
     };
 
     static class App { String pkg, label; ResolveInfo ri; Drawable banner; boolean isBanner; }
-    static class ShelfItem { int type; App app; FrameLayout card; float x, width; int extraId; }
+    static class ShelfItem { int type; App app; FrameLayout card; float x, width; int extraId; String inputId; }
+
+    static class TvInputItem {
+        String id;
+        String label;
+        int type;
+        int extraId;
+    }
 
     final ArrayList<App> apps = new ArrayList<App>();
     final ArrayList<ShelfItem> shelfItems = new ArrayList<ShelfItem>();
+    final ArrayList<TvInputItem> detectedInputs = new ArrayList<TvInputItem>();
 
-    int shelfIdx = FIRST_APP_INDEX; // Default to first real app (after Gemini, Sleep, HDMI 1-3, AV)
+    int getFirstAppIndex() {
+        return 2 + detectedInputs.size();
+    }
+
+    int shelfIdx = 2; // Default to first real app (adjusted dynamically after TV input detection)
     boolean visible, longPressed, reorderMode;
     float curShelfTransX = 0;
     RectF glassRect = new RectF();
@@ -270,7 +282,7 @@ public class HomeActivity extends Activity {
 
     final Runnable longPressRunnable = new Runnable() {
         public void run() {
-            if (shelfIdx >= FIRST_APP_INDEX) {
+            if (shelfIdx >= getFirstAppIndex()) {
                 longPressed = true;
                 toggleReorderMode();
             }
@@ -287,7 +299,7 @@ public class HomeActivity extends Activity {
         prefs = getSharedPreferences("state", MODE_PRIVATE);
         fThin = font("outfit_200.ttf"); fLight = font("outfit_300.ttf");
         fReg = font("outfit_400.ttf"); fMed = font("outfit_500.ttf"); fBold = font("outfit_600.ttf");
-        shelfIdx = FIRST_APP_INDEX; // Always default to first real app
+        shelfIdx = getFirstAppIndex();
 
         loadConfigFile();
         buildUi();
@@ -430,6 +442,8 @@ public class HomeActivity extends Activity {
                     shelfAutohide = !"false".equalsIgnoreCase(val) && !val.equals("0");
                 } else if (key.equals("shelf_hide_timeout") || key.equals("hide_timeout")) {
                     try { shelfHideTimeout = Integer.parseInt(val); } catch (Exception e) {}
+                } else if (key.equals("show_inputs") || key.equals("inputs")) {
+                    showInputsConfig = val.toLowerCase().trim();
                 }
             }
             r.close();
@@ -494,7 +508,7 @@ public class HomeActivity extends Activity {
             toggleReorderMode();
             return;
         }
-        if (shelfIdx != FIRST_APP_INDEX) {
+        if (shelfIdx != getFirstAppIndex()) {
             goToFirstApp(true);
         }
     }
@@ -738,7 +752,94 @@ public class HomeActivity extends Activity {
         });
         apps.addAll(remaining);
 
+        detectTvInputs();
         rebuildShelf();
+    }
+
+    void detectTvInputs() {
+        detectedInputs.clear();
+        if ("false".equalsIgnoreCase(showInputsConfig) || "0".equals(showInputsConfig) || "no".equalsIgnoreCase(showInputsConfig)) {
+            android.util.Log.i("GlassHome", "detectTvInputs: disabled by config show_inputs=" + showInputsConfig);
+            return;
+        }
+
+        try {
+            TvInputManager tim = (TvInputManager) getSystemService(Context.TV_INPUT_SERVICE);
+            if (tim == null) {
+                android.util.Log.i("GlassHome", "detectTvInputs: TvInputManager is null (device has no TV subsystem)");
+                return;
+            }
+
+            List<TvInputInfo> list = tim.getTvInputList();
+            if (list == null || list.isEmpty()) {
+                android.util.Log.i("GlassHome", "detectTvInputs: getTvInputList returned 0 inputs");
+                return;
+            }
+
+            android.util.Log.i("GlassHome", "detectTvInputs: found " + list.size() + " total TV inputs in system");
+            for (TvInputInfo info : list) {
+                if (info == null) continue;
+                boolean isPassthrough = info.isPassthroughInput();
+                String parentId = info.getParentId();
+                android.util.Log.i("GlassHome", "TV Input: id=" + info.getId() + " type=" + info.getType()
+                        + " passthrough=" + isPassthrough + " parent=" + parentId);
+
+                // Only physical passthrough hardware ports (HDMI, Composite AV, Component)
+                if (!isPassthrough) continue;
+                // Exclude CEC child devices (which reference an existing physical port)
+                if (parentId != null && !parentId.isEmpty()) continue;
+
+                TvInputItem item = new TvInputItem();
+                item.id = info.getId();
+                item.type = info.getType();
+
+                CharSequence lbl = info.loadLabel(this);
+                String name = (lbl != null && lbl.length() > 0) ? lbl.toString().trim() : "";
+
+                if (name.equalsIgnoreCase("Composite") || item.type == TvInputInfo.TYPE_COMPOSITE || (item.id != null && item.id.contains("Composite"))) {
+                    name = "AV";
+                } else if (name.isEmpty() || name.equalsIgnoreCase("HDMI") || name.equalsIgnoreCase("Input")) {
+                    if (item.type == TvInputInfo.TYPE_HDMI || (item.id != null && item.id.contains("Hdmi"))) {
+                        if (item.id != null && item.id.contains("HW2")) name = "HDMI 1";
+                        else if (item.id != null && item.id.contains("HW3")) name = "HDMI 2";
+                        else if (item.id != null && item.id.contains("HW4")) name = "HDMI 3";
+                        else if (item.id != null && item.id.contains("HW5")) name = "HDMI 4";
+                        else name = "HDMI";
+                    } else if (item.type == TvInputInfo.TYPE_COMPONENT || (item.id != null && item.id.contains("Component"))) {
+                        name = "Component";
+                    } else {
+                        name = "Input";
+                    }
+                }
+                item.label = name;
+
+                // Fire OS Kamino fallback extraId mapping
+                if (item.id != null) {
+                    if (item.id.contains("HW2")) item.extraId = 2;
+                    else if (item.id.contains("HW3")) item.extraId = 3;
+                    else if (item.id.contains("HW4")) item.extraId = 4;
+                    else if (item.id.contains("HW5")) item.extraId = 5;
+                    else if (item.id.contains("HW6") || item.type == TvInputInfo.TYPE_COMPOSITE) item.extraId = 11;
+                }
+
+                detectedInputs.add(item);
+                android.util.Log.i("GlassHome", "detectTvInputs: Added passthrough input " + item.label + " (id=" + item.id + ")");
+            }
+
+            // Natural sort: All HDMI ports first (HDMI 1, HDMI 2, ...), followed by AV / Component
+            Collections.sort(detectedInputs, new Comparator<TvInputItem>() {
+                public int compare(TvInputItem a, TvInputItem b) {
+                    boolean aIsHdmi = a.label != null && a.label.startsWith("HDMI");
+                    boolean bIsHdmi = b.label != null && b.label.startsWith("HDMI");
+                    if (aIsHdmi && !bIsHdmi) return -1;
+                    if (!aIsHdmi && bIsHdmi) return 1;
+                    return a.label.compareToIgnoreCase(b.label);
+                }
+            });
+
+        } catch (Exception e) {
+            android.util.Log.e("GlassHome", "detectTvInputs error: " + e.getMessage(), e);
+        }
     }
 
     void addResolves(List<ResolveInfo> list, HashMap<String, App> byPkg, HashSet<String> seen) {
@@ -783,17 +884,16 @@ public class HomeActivity extends Activity {
         shelfItems.add(sleepItem);
         curX += ACTION_W_SLEEP + GAP;
 
-        // Input buttons (HDMI 1, HDMI 2, HDMI 3, Composite AV)
-        int[] inputTypes = { 2, 3, 4, 11 };
-        String[] inputNames = { "HDMI 1", "HDMI 2", "HDMI 3", "AV" };
-        for (int i = 0; i < inputTypes.length; i++) {
-            ShelfItem inItem = makeActionTile(TYPE_INPUT, new Icon(Icon.HDMI), inputNames[i], curX, ACTION_W_INPUT);
-            inItem.extraId = inputTypes[i];
+        // 3. Dynamic TV Inputs (only if detected on this device)
+        for (TvInputItem in : detectedInputs) {
+            ShelfItem inItem = makeActionTile(TYPE_INPUT, new Icon(Icon.HDMI), in.label, curX, ACTION_W_INPUT);
+            inItem.extraId = in.extraId;
+            inItem.inputId = in.id;
             shelfItems.add(inItem);
             curX += ACTION_W_INPUT + GAP;
         }
 
-        // 3. ALL APPS IN 1 COMPACT ROW (index 2 onwards)
+        // 4. ALL APPS IN 1 COMPACT ROW (index getFirstAppIndex() onwards)
         for (int i = 0; i < apps.size(); i++) {
             ShelfItem appItem = makeAppTile(apps.get(i), curX, APP_TILE_W);
             shelfItems.add(appItem);
@@ -919,7 +1019,7 @@ public class HomeActivity extends Activity {
     }
 
     void toggleReorderMode() {
-        if (shelfIdx < FIRST_APP_INDEX) return;
+        if (shelfIdx < getFirstAppIndex()) return;
         reorderMode = !reorderMode;
         if (reorderMode) {
             Toast.makeText(this, "✦ MOVE MODE: D-pad Left/Right to reorder, OK to save", Toast.LENGTH_SHORT).show();
@@ -933,7 +1033,7 @@ public class HomeActivity extends Activity {
 
     void goToFirstApp(boolean animate) {
         if (reorderMode) toggleReorderMode();
-        shelfIdx = (shelfItems.size() > FIRST_APP_INDEX) ? FIRST_APP_INDEX : 0;
+        shelfIdx = (shelfItems.size() > getFirstAppIndex()) ? getFirstAppIndex() : 0;
         focusCurrent(animate);
     }
 
@@ -972,7 +1072,7 @@ public class HomeActivity extends Activity {
         if (k == KeyEvent.KEYCODE_BACK) {
             if (e.getAction() == KeyEvent.ACTION_UP) {
                 if (reorderMode) { toggleReorderMode(); return true; }
-                if (shelfIdx != FIRST_APP_INDEX) {
+                if (shelfIdx != getFirstAppIndex()) {
                     goToFirstApp(true);
                 }
             }
@@ -984,7 +1084,7 @@ public class HomeActivity extends Activity {
                 if (e.isLongPress() || (e.getFlags() & KeyEvent.FLAG_LONG_PRESS) != 0) {
                     handler.removeCallbacks(longPressRunnable);
                     longPressed = true;
-                    if (!reorderMode && shelfIdx >= FIRST_APP_INDEX) {
+                    if (!reorderMode && shelfIdx >= getFirstAppIndex()) {
                         toggleReorderMode();
                     }
                     return true;
@@ -992,10 +1092,10 @@ public class HomeActivity extends Activity {
                 if (e.getRepeatCount() == 0) {
                     longPressed = false;
                     handler.removeCallbacks(longPressRunnable);
-                    if (!reorderMode && shelfIdx >= FIRST_APP_INDEX) {
+                    if (!reorderMode && shelfIdx >= getFirstAppIndex()) {
                         handler.postDelayed(longPressRunnable, 500);
                     }
-                } else if (!longPressed && !reorderMode && shelfIdx >= FIRST_APP_INDEX && e.getRepeatCount() >= 4) {
+                } else if (!longPressed && !reorderMode && shelfIdx >= getFirstAppIndex() && e.getRepeatCount() >= 4) {
                     handler.removeCallbacks(longPressRunnable);
                     longPressed = true;
                     toggleReorderMode();
@@ -1020,8 +1120,8 @@ public class HomeActivity extends Activity {
         handler.removeCallbacks(longPressRunnable);
 
         if (reorderMode) {
-            if (k == KeyEvent.KEYCODE_DPAD_LEFT && shelfIdx > FIRST_APP_INDEX) {
-                int appPos = shelfIdx - FIRST_APP_INDEX;
+            if (k == KeyEvent.KEYCODE_DPAD_LEFT && shelfIdx > getFirstAppIndex()) {
+                int appPos = shelfIdx - getFirstAppIndex();
                 App temp = apps.get(appPos);
                 apps.set(appPos, apps.get(appPos - 1));
                 apps.set(appPos - 1, temp);
@@ -1029,7 +1129,7 @@ public class HomeActivity extends Activity {
                 rebuildShelf();
                 return true;
             } else if (k == KeyEvent.KEYCODE_DPAD_RIGHT && shelfIdx < shelfItems.size() - 1) {
-                int appPos = shelfIdx - FIRST_APP_INDEX;
+                int appPos = shelfIdx - getFirstAppIndex();
                 App temp = apps.get(appPos);
                 apps.set(appPos, apps.get(appPos + 1));
                 apps.set(appPos + 1, temp);
@@ -1158,7 +1258,7 @@ public class HomeActivity extends Activity {
             return;
         }
         if (item.type == TYPE_INPUT) {
-            tuneInput(item.extraId);
+            tuneInput(item.inputId, item.extraId);
             return;
         }
 
@@ -1212,24 +1312,43 @@ public class HomeActivity extends Activity {
         }
     }
 
-    void tuneInput(int inputType) {
-        android.util.Log.i("GlassHome", "tuneInput requested for type: " + inputType);
-        try {
-            Intent intent = new Intent();
-            intent.setClassName("com.amazon.tv.inputpreference.service", "com.amazon.tv.inputpreference.service.KaminoInputSwitchService");
-            intent.putExtra("inputType", inputType);
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                startForegroundService(intent);
-            } else {
-                startService(intent);
-            }
-        } catch (Exception e) {
-            android.util.Log.e("GlassHome", "Failed to start KaminoInputSwitchService: " + e.getMessage());
+    void tuneInput(String inputId, int extraId) {
+        android.util.Log.i("GlassHome", "tuneInput requested: id=" + inputId + " extraId=" + extraId);
+
+        // 1. Standard Android TV passthrough tune
+        if (inputId != null && !inputId.isEmpty()) {
             try {
-                // Fallback to sending TV_INPUT keyevent
-                Runtime.getRuntime().exec(new String[]{"input", "keyevent", "178"});
-            } catch (Exception ignored) {}
+                Uri uri = TvContract.buildChannelUriForPassthroughInput(inputId);
+                Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
+                return;
+            } catch (Exception e) {
+                android.util.Log.w("GlassHome", "Failed to launch via TvContract: " + e.getMessage());
+            }
         }
+
+        // 2. Fire OS Kamino fallback
+        if (extraId > 0) {
+            try {
+                Intent intent = new Intent();
+                intent.setClassName("com.amazon.tv.inputpreference.service", "com.amazon.tv.inputpreference.service.KaminoInputSwitchService");
+                intent.putExtra("inputType", extraId);
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    startForegroundService(intent);
+                } else {
+                    startService(intent);
+                }
+                return;
+            } catch (Exception e) {
+                android.util.Log.e("GlassHome", "Failed to start KaminoInputSwitchService: " + e.getMessage());
+            }
+        }
+
+        try {
+            // Generic TV input fallback key
+            Runtime.getRuntime().exec(new String[]{"input", "keyevent", "178"});
+        } catch (Exception ignored) {}
     }
 
     void start(Intent i) {
