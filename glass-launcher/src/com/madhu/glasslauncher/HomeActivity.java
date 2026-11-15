@@ -107,11 +107,12 @@ public class HomeActivity extends Activity {
     static final float TIME_Y = 432;
     static final float ACTION_W_GEMINI = 96;
     static final float ACTION_W_SLEEP = 86;
+    static final float ACTION_W_INPUT = 88;
     static final float APP_TILE_W = 78;
     static final float GAP = 12;
     static final float SCALE = 1.08f;
 
-    static final int TYPE_GEMINI = 0, TYPE_SLEEP = 1, TYPE_APP = 2;
+    static final int TYPE_GEMINI = 0, TYPE_SLEEP = 1, TYPE_APP = 2, TYPE_INPUT = 3;
 
     float dp;
     Typeface fThin, fLight, fReg, fMed, fBold;
@@ -253,12 +254,12 @@ public class HomeActivity extends Activity {
     };
 
     static class App { String pkg, label; ResolveInfo ri; Drawable banner; boolean isBanner; }
-    static class ShelfItem { int type; App app; FrameLayout card; float x, width; }
+    static class ShelfItem { int type; App app; FrameLayout card; float x, width; int extraId; }
 
     final ArrayList<App> apps = new ArrayList<App>();
     final ArrayList<ShelfItem> shelfItems = new ArrayList<ShelfItem>();
 
-    int shelfIdx = 2; // Always default to first real app (YouTube)
+    int shelfIdx = 6; // Default to first real app (after Gemini, Sleep, HDMI 1-3, AV)
     boolean visible, longPressed, reorderMode;
     float curShelfTransX = 0;
     RectF glassRect = new RectF();
@@ -781,6 +782,16 @@ public class HomeActivity extends Activity {
         shelfItems.add(sleepItem);
         curX += ACTION_W_SLEEP + GAP;
 
+        // Input buttons (HDMI 1, HDMI 2, HDMI 3, Composite AV)
+        int[] inputTypes = { 2, 3, 4, 11 };
+        String[] inputNames = { "HDMI 1", "HDMI 2", "HDMI 3", "AV" };
+        for (int i = 0; i < inputTypes.length; i++) {
+            ShelfItem inItem = makeActionTile(TYPE_INPUT, new Icon(Icon.HDMI), inputNames[i], curX, ACTION_W_INPUT);
+            inItem.extraId = inputTypes[i];
+            shelfItems.add(inItem);
+            curX += ACTION_W_INPUT + GAP;
+        }
+
         // 3. ALL APPS IN 1 COMPACT ROW (index 2 onwards)
         for (int i = 0; i < apps.size(); i++) {
             ShelfItem appItem = makeAppTile(apps.get(i), curX, APP_TILE_W);
@@ -919,7 +930,7 @@ public class HomeActivity extends Activity {
 
     void goToFirstApp(boolean animate) {
         if (reorderMode) toggleReorderMode();
-        shelfIdx = (shelfItems.size() > 2) ? 2 : 0;
+        shelfIdx = (shelfItems.size() > 6) ? 6 : 0;
         focusCurrent(animate);
     }
 
@@ -1143,6 +1154,10 @@ public class HomeActivity extends Activity {
             triggerSleep();
             return;
         }
+        if (item.type == TYPE_INPUT) {
+            tuneInput(item.extraId);
+            return;
+        }
 
         if (item.app != null) {
             Intent i = pm.getLeanbackLaunchIntentForPackage(item.app.pkg);
@@ -1191,6 +1206,26 @@ public class HomeActivity extends Activity {
             } catch (Exception e2) {
                 Toast.makeText(this, "Assistant unavailable", Toast.LENGTH_SHORT).show();
             }
+        }
+    }
+
+    void tuneInput(int inputType) {
+        android.util.Log.i("GlassHome", "tuneInput requested for type: " + inputType);
+        try {
+            Intent intent = new Intent();
+            intent.setClassName("com.amazon.tv.inputpreference.service", "com.amazon.tv.inputpreference.service.KaminoInputSwitchService");
+            intent.putExtra("inputType", inputType);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+        } catch (Exception e) {
+            android.util.Log.e("GlassHome", "Failed to start KaminoInputSwitchService: " + e.getMessage());
+            try {
+                // Fallback to sending TV_INPUT keyevent
+                Runtime.getRuntime().exec(new String[]{"input", "keyevent", "178"});
+            } catch (Exception ignored) {}
         }
     }
 
@@ -1280,9 +1315,9 @@ public class HomeActivity extends Activity {
         @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
     }
 
-    /** Small vector icons for Gemini and Sleep. */
+    /** Small vector icons for Gemini, Sleep, and HDMI Inputs. */
     class Icon extends Drawable {
-        static final int GEMINI = 0, SLEEP = 1;
+        static final int GEMINI = 0, SLEEP = 1, HDMI = 2;
         final int kind;
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         Icon(int k) {
@@ -1320,6 +1355,12 @@ public class HomeActivity extends Activity {
                 float cx = 9 * u, cy = 9.5f * u, r = 5.2f * u;
                 c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), -60, 300, false, p);
                 c.drawLine(cx, cy - r - 1.8f * u, cx, cy, p);
+            } else if (kind == HDMI) {
+                // Video display / screen input icon
+                float left = 2.5f * u, top = 3.5f * u, right = 15.5f * u, bot = 12.5f * u;
+                c.drawRoundRect(new RectF(left, top, right, bot), 1.5f * u, 1.5f * u, p);
+                c.drawLine(9 * u, bot, 9 * u, bot + 2.5f * u, p);
+                c.drawLine(6 * u, bot + 2.5f * u, 12 * u, bot + 2.5f * u, p);
             }
             c.restore();
         }
