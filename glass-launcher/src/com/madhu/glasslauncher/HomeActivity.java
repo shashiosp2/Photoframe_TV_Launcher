@@ -111,6 +111,7 @@ public class HomeActivity extends Activity {
     static final float APP_TILE_W = 78;
     static final float GAP = 12;
     static final float SCALE = 1.08f;
+    static final int FIRST_APP_INDEX = 6;
 
     static final int TYPE_GEMINI = 0, TYPE_SLEEP = 1, TYPE_APP = 2, TYPE_INPUT = 3;
 
@@ -131,7 +132,7 @@ public class HomeActivity extends Activity {
     int shelfHideTimeout = 8; // seconds
     boolean isShelfHidden = false;
 
-    String deviceName = "NVIDIA AndroidTV";
+    String deviceName = "Hisense FireTV";
     String tzLeft = "America/Chicago";
     String tzLeftTag = "CST";
     String tzRight = "Asia/Kolkata";
@@ -259,7 +260,7 @@ public class HomeActivity extends Activity {
     final ArrayList<App> apps = new ArrayList<App>();
     final ArrayList<ShelfItem> shelfItems = new ArrayList<ShelfItem>();
 
-    int shelfIdx = 6; // Default to first real app (after Gemini, Sleep, HDMI 1-3, AV)
+    int shelfIdx = FIRST_APP_INDEX; // Default to first real app (after Gemini, Sleep, HDMI 1-3, AV)
     boolean visible, longPressed, reorderMode;
     float curShelfTransX = 0;
     RectF glassRect = new RectF();
@@ -269,7 +270,7 @@ public class HomeActivity extends Activity {
 
     final Runnable longPressRunnable = new Runnable() {
         public void run() {
-            if (shelfIdx >= 2) {
+            if (shelfIdx >= FIRST_APP_INDEX) {
                 longPressed = true;
                 toggleReorderMode();
             }
@@ -286,7 +287,7 @@ public class HomeActivity extends Activity {
         prefs = getSharedPreferences("state", MODE_PRIVATE);
         fThin = font("outfit_200.ttf"); fLight = font("outfit_300.ttf");
         fReg = font("outfit_400.ttf"); fMed = font("outfit_500.ttf"); fBold = font("outfit_600.ttf");
-        shelfIdx = 2; // Always default to first real app
+        shelfIdx = FIRST_APP_INDEX; // Always default to first real app
 
         loadConfigFile();
         buildUi();
@@ -493,7 +494,7 @@ public class HomeActivity extends Activity {
             toggleReorderMode();
             return;
         }
-        if (shelfIdx != 2) {
+        if (shelfIdx != FIRST_APP_INDEX) {
             goToFirstApp(true);
         }
     }
@@ -822,17 +823,19 @@ public class HomeActivity extends Activity {
         LinearLayout ll = new LinearLayout(this);
         ll.setOrientation(LinearLayout.HORIZONTAL);
         ll.setGravity(Gravity.CENTER);
-        ll.setPadding(px(12), 0, px(14), 0);
+        ll.setPadding(px(8), 0, px(8), 0);
 
         ImageView iv = new ImageView(this);
         iv.setImageDrawable(icon);
-        ll.addView(iv, new LinearLayout.LayoutParams(px(18), px(18)));
+        ll.addView(iv, new LinearLayout.LayoutParams(px(16), px(16)));
 
-        TextView n = text(13.5f, fMed, type == TYPE_GEMINI ? 0xFF38BDF8 : 0xCCFFFFFF);
+        TextView n = text(11.5f, fMed, type == TYPE_GEMINI ? 0xFF38BDF8 : 0xFFFFFFFF);
         n.setText(label);
         n.setSingleLine(true);
+        n.setTextScaleX(0.88f);
+        n.setLetterSpacing(-0.03f);
         LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(-2, -2);
-        nl.leftMargin = px(8);
+        nl.leftMargin = px(5);
         ll.addView(n, nl);
 
         item.card.addView(ll, new FrameLayout.LayoutParams(-1, -1));
@@ -916,7 +919,7 @@ public class HomeActivity extends Activity {
     }
 
     void toggleReorderMode() {
-        if (shelfIdx < 2) return;
+        if (shelfIdx < FIRST_APP_INDEX) return;
         reorderMode = !reorderMode;
         if (reorderMode) {
             Toast.makeText(this, "✦ MOVE MODE: D-pad Left/Right to reorder, OK to save", Toast.LENGTH_SHORT).show();
@@ -930,7 +933,7 @@ public class HomeActivity extends Activity {
 
     void goToFirstApp(boolean animate) {
         if (reorderMode) toggleReorderMode();
-        shelfIdx = (shelfItems.size() > 6) ? 6 : 0;
+        shelfIdx = (shelfItems.size() > FIRST_APP_INDEX) ? FIRST_APP_INDEX : 0;
         focusCurrent(animate);
     }
 
@@ -969,7 +972,7 @@ public class HomeActivity extends Activity {
         if (k == KeyEvent.KEYCODE_BACK) {
             if (e.getAction() == KeyEvent.ACTION_UP) {
                 if (reorderMode) { toggleReorderMode(); return true; }
-                if (shelfIdx != 2) {
+                if (shelfIdx != FIRST_APP_INDEX) {
                     goToFirstApp(true);
                 }
             }
@@ -981,7 +984,7 @@ public class HomeActivity extends Activity {
                 if (e.isLongPress() || (e.getFlags() & KeyEvent.FLAG_LONG_PRESS) != 0) {
                     handler.removeCallbacks(longPressRunnable);
                     longPressed = true;
-                    if (!reorderMode && shelfIdx >= 2) {
+                    if (!reorderMode && shelfIdx >= FIRST_APP_INDEX) {
                         toggleReorderMode();
                     }
                     return true;
@@ -989,10 +992,10 @@ public class HomeActivity extends Activity {
                 if (e.getRepeatCount() == 0) {
                     longPressed = false;
                     handler.removeCallbacks(longPressRunnable);
-                    if (!reorderMode && shelfIdx >= 2) {
+                    if (!reorderMode && shelfIdx >= FIRST_APP_INDEX) {
                         handler.postDelayed(longPressRunnable, 500);
                     }
-                } else if (!longPressed && !reorderMode && shelfIdx >= 2 && e.getRepeatCount() >= 4) {
+                } else if (!longPressed && !reorderMode && shelfIdx >= FIRST_APP_INDEX && e.getRepeatCount() >= 4) {
                     handler.removeCallbacks(longPressRunnable);
                     longPressed = true;
                     toggleReorderMode();
@@ -1017,8 +1020,8 @@ public class HomeActivity extends Activity {
         handler.removeCallbacks(longPressRunnable);
 
         if (reorderMode) {
-            if (k == KeyEvent.KEYCODE_DPAD_LEFT && shelfIdx > 2) {
-                int appPos = shelfIdx - 2;
+            if (k == KeyEvent.KEYCODE_DPAD_LEFT && shelfIdx > FIRST_APP_INDEX) {
+                int appPos = shelfIdx - FIRST_APP_INDEX;
                 App temp = apps.get(appPos);
                 apps.set(appPos, apps.get(appPos - 1));
                 apps.set(appPos - 1, temp);
@@ -1026,7 +1029,7 @@ public class HomeActivity extends Activity {
                 rebuildShelf();
                 return true;
             } else if (k == KeyEvent.KEYCODE_DPAD_RIGHT && shelfIdx < shelfItems.size() - 1) {
-                int appPos = shelfIdx - 2;
+                int appPos = shelfIdx - FIRST_APP_INDEX;
                 App temp = apps.get(appPos);
                 apps.set(appPos, apps.get(appPos + 1));
                 apps.set(appPos + 1, temp);
